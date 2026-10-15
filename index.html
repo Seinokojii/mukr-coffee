@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>МУКР Кофе — бонусная карта</title>
+<meta name="description" content="Бонусная карта кофейни МУКР: 10 баллов за стакан, на 60 баллах — кофе бесплатно.">
+<meta name="theme-color" content="#1E1915">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&family=JetBrains+Mono:wght@500;700&family=Onest:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css?v=1">
+</head>
+<body>
+<!-- Неровная кромка штампа: общий фильтр для всех оттисков -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <filter id="ink" x="-10%" y="-10%" width="120%" height="120%">
+    <feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="2" seed="4" result="n"/>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="2.4"/>
+  </filter>
+</svg>
+<main id="app" aria-live="polite"></main>
+<div id="toast" role="status"></div>
+<script src="vendor/qrcode.min.js"></script>
+<script src="vendor/jsQR.min.js" defer></script>
+<script src="app.js?v=1"></script>
+</body>
+</html>
