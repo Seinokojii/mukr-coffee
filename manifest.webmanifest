@@ -3,7 +3,7 @@
   "short_name": "МУКР Кофе",
   "start_url": "./",
   "display": "standalone",
-  "background_color": "#ECEEE4",
-  "theme_color": "#1E1915",
+  "background_color": "#1B4DB1",
+  "theme_color": "#1B4DB1",
   "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
 }
