@@ -71,7 +71,7 @@
       <circle cx="50" cy="50" r="33" fill="none" stroke="currentColor" stroke-width="1.6"/>
       <text font-family="JetBrains Mono, monospace" font-size="8.6" font-weight="700" fill="currentColor" textLength="246" lengthAdjust="spacing">
         <textPath href="#${id}">МУКР · КОФЕ · 1993 · МУКР · КОФЕ · 1993 ·</textPath></text>
-      ${tower("translate(36.2 23.4) scale(.46)", "currentColor", "#F3F4F9")}
+      ${tower("translate(36.2 23.4) scale(.46)", "currentColor", "#FFFFFF")}
     </svg>`;
   };
   const brandMark = () => `<svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="31" fill="#F1D3A1"/><circle cx="32" cy="32" r="26" fill="#16006F"/>${tower("translate(20.6 10.5) scale(.38)", "#fff", "#16006F")}</svg>`;
@@ -199,7 +199,7 @@
     const extra = ready && points > RULES.freeCost ? ` На карте ещё ${pts(points - RULES.freeCost)} сверху.` : "";
     const foot = ready
       ? `<p class="card-foot ready">${desk ? "Можно выдать бесплатный кофе." : "Бесплатный кофе готов — скажите бариста."}${extra}</p>`
-      : `<p class="card-foot">Ещё ${cups(left)} — и следующий кофе бесплатно.</p>`;
+      : `<p class="card-foot">Ещё <b>${cups(left)}</b> — и следующий кофе бесплатно.</p>`;
     return `<div class="stamps${row ? " row" : ""}">${slotsHtml(points, freshFrom)}</div>${foot}`;
   }
 
@@ -208,18 +208,18 @@
     const p = RULES.prices;
     $app.innerHTML = `
       <header class="top">
-        <a class="brand" href="#">${brandMark()}<span><b>МУКР Кофе</b><small>БОНУСНАЯ КАРТА</small></span></a>
+        <a class="brand" href="#">${brandMark()}<span><b>МУКР Кофе</b><small>Бонусная карта</small></span></a>
         <button class="ghost" data-go="login">Войти</button>
       </header>
       <section class="hero intro">
         <div>
           <div class="seal">${sealSvg()}</div>
-          <p class="kicker">Кофейня МУКР</p>
+          <p class="kicker">Для студентов МУКР</p>
           <h1><span class="ln"><span>Седьмой кофе —</span></span><span class="ln"><span><em>за счёт</em></span></span><span class="ln"><span><em>кофейни</em></span></span></h1>
           <p class="lead">${RULES.perCup} баллов за каждый стакан. Накопили ${RULES.freeCost} — следующий кофе бесплатно. Карта всегда в телефоне.</p>
           <div class="cta-row">
-            <button class="btn foam" data-go="register">Завести карту</button>
-            <button class="btn glass" data-go="login">У меня уже есть</button>
+            <button class="btn" data-go="register">Завести карту</button>
+            <button class="btn soft" data-go="login">У меня уже есть карта</button>
           </div>
           <div class="prices">
             <div><b>${p.s} <small>сом</small></b>Маленький</div>
@@ -229,7 +229,7 @@
         </div>
         <div class="stage" id="stage" aria-label="Пример карты: бариста ставит штамп за каждый стакан">
           <div class="tilt"><div class="card" id="demo">
-            <div class="card-head"><span class="name">Пример карты</span><span>${RULES.perCup} за стакан</span></div>
+            <div class="card-head"><span class="name">Пример карты</span><span>+${RULES.perCup} за стакан</span></div>
             ${ptsHtml(0)}
             <div class="stamps" id="demoSlots">${slotsHtml(0)}</div>
             <div class="badge" id="badge">${ico("gift")}Кофе бесплатно</div>
@@ -416,23 +416,23 @@
     state.lastOp = hist.length ? hist[0].id : seen;
     const ready = points >= RULES.freeCost;
     $app.innerHTML = `
-      ${headerUser("БОНУСНАЯ КАРТА")}
+      ${headerUser("Бонусная карта")}
       <div class="shell${first ? "" : " calm"}">
-        <div class="hello"><h1>${esc(u.name.split(" ")[0])}</h1><p>${esc(u.group)}</p></div>
+        <div class="hello"><h1>Привет, ${esc(u.name.split(" ")[0])}</h1><p>${esc(u.group)}</p></div>
         <section class="ticket" aria-label="Ваш QR-код">
           <button class="iconbtn grow" id="grow" aria-label="Открыть QR во весь экран">${ico("max")}</button>
           <button class="qr" id="qr" aria-label="Открыть QR во весь экран">${qrSvg(u.code)}</button>
           <div class="code">${fmtCode(u.code)}</div>
-          <p class="cap">Покажите бариста при оплате. Если камера не берёт — продиктуйте код.</p>
+          <p class="cap">Покажите код на кассе. Если камера не считает — назовите бариста буквы под ним.</p>
         </section>
         <section class="card${ready ? " ready" : ""}" id="myCard" aria-label="Баллы">
-          <div class="card-head"><span>Баллы</span><span>${RULES.perCup} за стакан</span></div>
+          <div class="card-head"><span>Ваши баллы</span><span>+${RULES.perCup} за каждый стакан</span></div>
           ${ptsHtml(prev ?? points)}
           ${stampCard(points, { row: true, freshFrom })}
         </section>
         ${me ? `<div class="facts">
-          <div class="fact"><b>${me.cups}</b><span>${plural(me.cups, "стакан выпит", "стакана выпито", "стаканов выпито")} по карте</span></div>
-          <div class="fact"><b>${me.free}</b><span>${plural(me.free, "бесплатный получен", "бесплатных получено", "бесплатных получено")}</span></div>
+          <div class="fact"><b>${me.cups}</b><span>${plural(me.cups, "стакан", "стакана", "стаканов")} по карте</span></div>
+          <div class="fact"><b>${me.free}</b><span>${plural(me.free, "бесплатный кофе", "бесплатных кофе", "бесплатных кофе")}</span></div>
         </div>` : ""}
         <section class="hist">
           <h2>История</h2>
@@ -480,7 +480,7 @@
   function viewDesk() {
     const u = state.user;
     $app.innerHTML = `
-      ${headerUser("КАССА · " + esc(u.name).toUpperCase())}
+      ${headerUser("Касса · " + esc(u.name))}
       <div class="desk">
         <div class="col">
           <section class="scan" aria-label="Сканер">
@@ -642,7 +642,7 @@
   // Башня на фоне: при прокрутке уходит вверх медленнее страницы — даёт глубину.
   function backdrop() {
     const bg = document.querySelector(".bg");
-    bg.insertAdjacentHTML("beforeend", `<svg class="spire" viewBox="12 0 36 116" aria-hidden="true">${tower("", "currentColor", "#16006F")}</svg>`);
+    bg.insertAdjacentHTML("beforeend", `<svg class="spire" viewBox="12 0 36 116" aria-hidden="true">${tower("", "currentColor", "#F1F1FA")}</svg>`);
     if (!MOTION) return;
     const sp = bg.querySelector(".spire");
     let raf = 0;
