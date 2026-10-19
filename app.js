@@ -34,26 +34,53 @@
   };
   const ico = (n, s = 20) => `<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24 24" aria-hidden="true">${P[n]}</svg>`;
 
-  // Оттиск штампа: кольцо + стакан + надпись по кругу. Цвет берёт от currentColor.
+  // Башня МУКР с эмблемы (шпиль, фонарь, барабан, арки), рамка 60×116.
+  // Части снизу вверх: --i задаёт очередь, в которой они прорисовываются на первом экране.
+  const TOWER = [
+    "M15 108H45V113H15Z", "M20 83H40V108H20Z", "M18 80H42V83H18Z", "M24 61H36V80H24Z",
+    "M22 58H38V61H22Z", "M26.5 42H33.5V58H26.5Z", "M27.6 39.5a2.4 2.4 0 1 0 4.8 0a2.4 2.4 0 1 0-4.8 0Z", "M30 2L31.8 37H28.2Z",
+  ];
+  const TOWER_CUTS = [ // арки внизу, окна барабана, прорезь фонаря
+    "M22.6 108V97a2 2 0 0 1 4 0V108Z", "M28 108V97a2 2 0 0 1 4 0V108Z", "M33.4 108V97a2 2 0 0 1 4 0V108Z",
+    "M26.4 76V69a1.4 1.4 0 0 1 2.8 0V76Z", "M30.8 76V69a1.4 1.4 0 0 1 2.8 0V76Z", "M29 54V47a1 1 0 0 1 2 0V54Z",
+  ];
+  const tower = (tf, body = "currentColor", cut = "none") =>
+    `<g transform="${tf}"><g class="tw" fill="${body}">${TOWER.map((d, i) => `<path d="${d}" pathLength="1" style="--i:${i}"/>`).join("")}</g>` +
+    `<g class="tw-cuts" fill="${cut}">${TOWER_CUTS.map(d => `<path d="${d}" pathLength="1"/>`).join("")}</g></g>`;
+
+  // Печать на первом экране: кольцо с названием университета, чашка, пар и башня (анимация — в CSS, .seal).
+  const sealSvg = () => `<svg viewBox="0 0 200 200" aria-hidden="true">
+    <g class="ring-wrap">
+      <circle class="edge" cx="100" cy="100" r="97"/>
+      <g class="ring"><defs><path id="sealArc" d="M100 100m-84 0a84 84 0 1 1 168 0a84 84 0 1 1-168 0"/></defs>
+        <text textLength="522" lengthAdjust="spacing"><textPath href="#sealArc">МЕЖДУНАРОДНЫЙ УНИВЕРСИТЕТ КЫРГЫЗСКОЙ РЕСПУБЛИКИ · КОФЕЙНЯ · 1993 ·</textPath></text></g>
+      <circle class="disc" cx="100" cy="100" r="72"/>
+    </g>
+    ${[90, 100, 110].map(x => `<path class="steam" pathLength="1" d="M${x} 124c-7-12 7-20 0-30s7-20 0-30s7-20 0-28"/>`).join("")}
+    ${tower("translate(76 30) scale(.8)")}
+    <g class="cup"><path pathLength="1" d="M84 127H116V137a13 13 0 0 1-13 13H97a13 13 0 0 1-13-13Z"/><path pathLength="1" d="M116 130h3.5a5 5 0 0 1 0 10H116"/><path pathLength="1" d="M78 156H122"/></g>
+  </svg>`;
+
+  // Оттиск на карте — печать МУКР: кольцо, надпись по кругу, башня. Цвет чернил — currentColor.
   let stampId = 0;
   const stamp = () => {
     const id = "arc" + (++stampId);
     return `<svg class="st" viewBox="0 0 100 100" aria-hidden="true">
-      <defs><path id="${id}" d="M50 50 m-35 0 a35 35 0 1 1 70 0 a35 35 0 1 1 -70 0"/></defs>
-      <circle cx="50" cy="50" r="46" fill="none" stroke="currentColor" stroke-width="4"/>
-      <circle cx="50" cy="50" r="27" fill="none" stroke="currentColor" stroke-width="2"/>
-      <text font-family="JetBrains Mono, monospace" font-size="9.5" font-weight="700" letter-spacing="2.6" fill="currentColor">
-        <textPath href="#${id}">МУКР · КОФЕ · МУКР · КОФЕ ·</textPath></text>
-      <g transform="translate(36 35) scale(1.18)" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">${P.coffee}</g>
+      <defs><path id="${id}" d="M50 50 m-40 0 a40 40 0 1 1 80 0 a40 40 0 1 1 -80 0"/></defs>
+      <circle cx="50" cy="50" r="47" fill="none" stroke="currentColor" stroke-width="3.5"/>
+      <circle cx="50" cy="50" r="33" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      <text font-family="JetBrains Mono, monospace" font-size="8.6" font-weight="700" fill="currentColor" textLength="246" lengthAdjust="spacing">
+        <textPath href="#${id}">МУКР · КОФЕ · 1993 · МУКР · КОФЕ · 1993 ·</textPath></text>
+      ${tower("translate(36.2 23.4) scale(.46)", "currentColor", "#F3F4F9")}
     </svg>`;
   };
-  const brandMark = () => `<svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="16" fill="#F6D9A0"/><circle cx="32" cy="32" r="21" fill="none" stroke="#0B2260" stroke-width="3"/><g fill="none" stroke="#0B2260" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" transform="translate(18 18) scale(1.17)">${P.coffee}</g></svg>`;
-  // Резиновый штамп для сцены на главной: ручка, корпус, красная подушка.
+  const brandMark = () => `<svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="31" fill="#F1D3A1"/><circle cx="32" cy="32" r="26" fill="#16006F"/>${tower("translate(20.6 10.5) scale(.38)", "#fff", "#16006F")}</svg>`;
+  // Резиновый штамп для сцены на главной: ручка цвета пенки, корпус, индиговая подушка.
   const toolSvg = `<svg viewBox="0 0 76 112" aria-hidden="true">
-    <ellipse cx="38" cy="17" rx="17" ry="15" fill="#F6D9A0"/><ellipse cx="33" cy="12" rx="6" ry="4" fill="#FFF3D9"/>
-    <rect x="31" y="28" width="14" height="30" rx="4" fill="#F6D9A0"/>
-    <rect x="8" y="56" width="60" height="32" rx="8" fill="#0B1433"/><rect x="8" y="56" width="60" height="8" rx="4" fill="#1B2A55"/>
-    <rect x="12" y="88" width="52" height="14" rx="4" fill="#D0182F"/></svg>`;
+    <ellipse cx="38" cy="17" rx="17" ry="15" fill="#F1D3A1"/><ellipse cx="33" cy="12" rx="6" ry="4" fill="#FFF1D6"/>
+    <rect x="31" y="28" width="14" height="30" rx="4" fill="#F1D3A1"/>
+    <rect x="8" y="56" width="60" height="32" rx="8" fill="#0F0A3C"/><rect x="8" y="56" width="60" height="8" rx="4" fill="#2A2A9E"/>
+    <rect x="12" y="88" width="52" height="14" rx="4" fill="#16006F"/></svg>`;
   const beanSvg = c => `<svg viewBox="0 0 16 22" width="16" height="22"><ellipse cx="8" cy="11" rx="7" ry="10" fill="${c}"/><path d="M8 2c-3.5 5 3.5 13 0 18" stroke="rgba(0,0,0,.35)" stroke-width="1.6" fill="none"/></svg>`;
 
   // ---------- помощники ----------
@@ -102,7 +129,7 @@
   function beans(el) {
     if (!MOTION || !el) return;
     const r = el.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 3;
-    const colors = ["#6B3F22", "#8A5530", "#F6D9A0", "#D0182F"];
+    const colors = ["#6B3F22", "#8A5530", "#F1D3A1", "#8F95D6"];
     for (let i = 0; i < 26; i++) {
       const b = document.createElement("div");
       b.className = "bean"; b.innerHTML = beanSvg(colors[i % colors.length]);
@@ -186,6 +213,7 @@
       </header>
       <section class="hero intro">
         <div>
+          <div class="seal">${sealSvg()}</div>
           <p class="kicker">Кофейня МУКР</p>
           <h1><span class="ln"><span>Седьмой кофе —</span></span><span class="ln"><span><em>за счёт</em></span></span><span class="ln"><span><em>кофейни</em></span></span></h1>
           <p class="lead">${RULES.perCup} баллов за каждый стакан. Накопили ${RULES.freeCost} — следующий кофе бесплатно. Карта всегда в телефоне.</p>
@@ -611,7 +639,20 @@
     else draw();
   }
 
+  // Башня на фоне: при прокрутке уходит вверх медленнее страницы — даёт глубину.
+  function backdrop() {
+    const bg = document.querySelector(".bg");
+    bg.insertAdjacentHTML("beforeend", `<svg class="spire" viewBox="12 0 36 116" aria-hidden="true">${tower("", "currentColor", "#16006F")}</svg>`);
+    if (!MOTION) return;
+    const sp = bg.querySelector(".spire");
+    let raf = 0;
+    addEventListener("scroll", () => {
+      if (!raf) raf = requestAnimationFrame(() => { raf = 0; sp.style.transform = `translate3d(0, ${-scrollY * .12}px, 0)`; });
+    }, { passive: true });
+  }
+
   async function boot() {
+    backdrop();
     $app.innerHTML = `<div class="loading">${ico("coffee", 44)}</div>`;
     api("rules").then(r => { RULES = r; }).catch(() => {});
     if (store.tok) {
