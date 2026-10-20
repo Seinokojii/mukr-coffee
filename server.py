@@ -13,7 +13,7 @@
     GOPAY_API_KEY, GOPAY_SECRET_KEY   ключи из кабинета merchant.gopay.kg (Test или Live)
     GOPAY_WEBHOOK_SECRET              секрет вебхука (Разработчику → Вебхуки), events_url = PUBLIC_URL/api/pay/gopay
     PUBLIC_URL                        адрес этого сервера, напр. https://mukrcoffee.62-113-109-193.sslip.io
-    PAY_MODE=demo                     без ключей: оплата подтверждается сама через несколько секунд (не деньги)
+    PAY_MODE=demo                     без ключей: заказ подтверждает бариста сканированием QR заказа (не деньги)
 """
 import hashlib, hmac, json, os, re, secrets, sqlite3, sys, threading, time, urllib.request
 from datetime import datetime, timedelta, timezone
@@ -32,7 +32,7 @@ GOPAY_KEY = os.environ.get("GOPAY_API_KEY", "")
 GOPAY_SECRET = os.environ.get("GOPAY_SECRET_KEY", "")
 GOPAY_HOOK_SECRET = os.environ.get("GOPAY_WEBHOOK_SECRET", "")
 PAY_MODE = "gopay" if GOPAY_KEY and GOPAY_SECRET else ("demo" if os.environ.get("PAY_MODE") == "demo" else "off")
-DEMO_DELAY = float(os.environ.get("DEMO_DELAY", "6"))   # демо: через сколько секунд «оплата прошла»
+PICKUP = "MUKRCOFFEE-ORDER:"  # QR заказа у ученика: бариста сканирует его — заказ подтверждён и выдан
 
 # Правила кофейни по умолчанию. Администратор меняет их в кабинете (таблица settings).
 DEFAULTS = {"per_cup": 10, "free_cost": 60, "price_s": 140, "price_l": 170}
@@ -189,7 +189,8 @@ def op_row(o):
 def order_row(o, full=False):
     d = {"id": o["id"], "num": o["num"], "size": o["size"], "amount": o["amount"], "free": bool(o["free"]),
          "status": o["status"], "provider": o["provider"], "via": o["via"], "test": bool(o["test"]),
-         "created": o["created"], "expires": o["expires"], "paidAt": o["paid_at"], "servedAt": o["served_at"]}
+         "created": o["created"], "expires": o["expires"], "paidAt": o["paid_at"], "servedAt": o["served_at"],
+         "pickup": PICKUP + o["ext_id"]}
     if full:
         d.update(qrData=o["qr_data"], checkoutUrl=o["checkout_url"], appLinks=json.loads(o["app_links"] or "{}"))
     return d
@@ -374,6 +375,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.get_order(con, self.auth(con), parts[1])
         if m == "POST" and len(parts) == 3 and parts[0] == "orders" and parts[2] == "cancel":
             return self.cancel_order(con, self.auth(con), parts[1])
+        if m == "POST" and r == "orders/scan":
+            return self.scan_order(con, self.auth(con, staff=True), self.body())
         if m == "POST" and len(parts) == 3 and parts[0] == "orders" and parts[2] == "serve":
             return self.serve_order(con, self.auth(con, staff=True), parts[1], self.body())
         # --- касса ---
@@ -522,9 +525,9 @@ class Handler(BaseHTTPRequestHandler):
                              json.dumps({k: v for k, v in (d.get("app_links") or {}).items() if safe_url(v)}),
                              int(bool(d.get("testing_mode"))), oid))
         else:
-            # Демо: свой QR со ссылкой на заказ — отсканировать его можно, но деньги не идут.
+            # Демо: банковского QR нет — ученик показывает QR заказа, бариста сканирует и этим подтверждает.
             with write_lock, con:
-                con.execute("UPDATE orders SET qr_data=? WHERE id=?", (f"MUKRCOFFEE-DEMO:{ext}", oid))
+                con.execute("UPDATE orders SET qr_data=? WHERE id=?", (PICKUP + ext, oid))
         return {"order": order_row(con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone(), True)}
 
     def own_order(self, con, u, oid):
@@ -540,9 +543,6 @@ class Handler(BaseHTTPRequestHandler):
             if now > o["expires"]:
                 with write_lock, con:
                     o = settle(con, o, "expired")
-            elif o["provider"] == "demo" and now - o["created"] >= DEMO_DELAY:
-                with write_lock, con:
-                    o = settle(con, o, "paid", test=True)
             elif o["provider"] == "gopay" and now - o["created"] >= 5 and now - o["checked"] >= 5:
                 # Страховка, если вебхук задержался: раз в 5 секунд спрашиваем статус у GoPay сами.
                 with write_lock, con:
@@ -556,7 +556,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ApiError:
                     pass
         res = {"order": order_row(o, full=o["status"] == "pending")}
-        if o["status"] == "paid":
+        if o["status"] in ("paid", "served"):
             res["points"] = con.execute("SELECT points FROM users WHERE id=?", (o["user_id"],)).fetchone()["points"]
         return res
 
@@ -588,20 +588,48 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Сначала отсканируйте QR ученика")
         if code != u["code"]:
             raise ApiError(409, "Это QR другого ученика — заказ не его")
-        now = int(time.time())
         with write_lock, con:
-            if con.execute("SELECT status FROM orders WHERE id=?", (o["id"],)).fetchone()["status"] != "paid":
-                raise ApiError(409, "Этот заказ не ждёт выдачи")
-            con.execute("UPDATE orders SET status='served', served_at=?, served_by=? WHERE id=?",
-                        (now, staff["id"], o["id"]))
-            delta = 0
-            op = con.execute("SELECT * FROM ops WHERE order_id=? AND kind='add' AND undone=0", (o["id"],)).fetchone()
-            if op and op["delta"] == 0:  # заказы, оплаченные до этой версии, баллы уже получили
-                delta = rules(con)["per_cup"]
-                con.execute("UPDATE users SET points=points+? WHERE id=?", (delta, u["id"]))
-                con.execute("UPDATE ops SET delta=?, ts=?, staff_id=? WHERE id=?", (delta, now, staff["id"], op["id"]))
-            u = con.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
-        return {"ok": True, "delta": delta, "card": public_card(u), "orders": self.waiting(con, u)}
+            return self.hand_over(con, staff, o)
+
+    def scan_order(self, con, staff, b):
+        """Бариста отсканировал QR заказа на телефоне ученика. Демо-заказ этим и подтверждается;
+        заказ GoPay должен быть уже оплачен банком."""
+        qr = str(b.get("qr", "")).strip()
+        ext = qr[len(PICKUP):] if qr.startswith(PICKUP) else ""
+        o = con.execute("SELECT * FROM orders WHERE ext_id=?", (ext,)).fetchone() if ext else None
+        if not o:
+            raise ApiError(404, "Заказ не найден")
+        with write_lock, con:
+            o = con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
+            if o["status"] == "pending" and o["expires"] < time.time():
+                o = settle(con, o, "expired")
+            if o["status"] == "pending" and o["provider"] == "demo":
+                o = settle(con, o, "paid", test=True)
+            if o["status"] == "pending":
+                raise ApiError(409, "Заказ ещё не оплачен — пусть ученик оплатит в банке")
+            if o["status"] == "served":
+                raise ApiError(409, f"Заказ №{o['num']} уже выдан")
+            if o["status"] != "paid":
+                raise ApiError(409, "Заказ отменён или время вышло — пусть оформит заново")
+            return self.hand_over(con, staff, o)
+
+    def hand_over(self, con, staff, o):
+        """Выдача (вызывать под write_lock): заказ → served, за оплаченный стакан +баллы."""
+        now = int(time.time())
+        if con.execute("SELECT status FROM orders WHERE id=?", (o["id"],)).fetchone()["status"] != "paid":
+            raise ApiError(409, "Этот заказ не ждёт выдачи")
+        u = con.execute("SELECT * FROM users WHERE id=?", (o["user_id"],)).fetchone()
+        con.execute("UPDATE orders SET status='served', served_at=?, served_by=? WHERE id=?",
+                    (now, staff["id"], o["id"]))
+        delta = 0
+        op = con.execute("SELECT * FROM ops WHERE order_id=? AND kind='add' AND undone=0", (o["id"],)).fetchone()
+        if op and op["delta"] == 0:  # заказы, оплаченные до этой версии, баллы уже получили
+            delta = rules(con)["per_cup"]
+            con.execute("UPDATE users SET points=points+? WHERE id=?", (delta, u["id"]))
+            con.execute("UPDATE ops SET delta=?, ts=?, staff_id=? WHERE id=?", (delta, now, staff["id"], op["id"]))
+        u = con.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+        o = con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
+        return {"ok": True, "delta": delta, "card": public_card(u), "orders": self.waiting(con, u), "order": order_row(o)}
 
     def gopay_hook(self, con):
         """Вебхук GoPay: и типизированный (events_url), и старый (callback_url). Подпись обязательна."""
@@ -686,12 +714,13 @@ class Handler(BaseHTTPRequestHandler):
                 "cash": sum(r["amount"] for r in money if r["pay"] == "cash")}
 
     def queue(self, con):
-        """Оплаченные заказы, которые ждут выдачи, и последние выданные."""
-        start = day_start()
+        """Заказы, которые ждут выдачи (оплаченные и демо, ждущие сканирования), и последние выданные."""
+        start, now = day_start(), int(time.time())
         q = """SELECT o.*, u.name, u.grp FROM orders o JOIN users u ON u.id=o.user_id WHERE """
-        wait = con.execute(q + "o.status='paid' AND o.paid_at>=? ORDER BY o.paid_at", (start - 6 * 3600,)).fetchall()
+        wait = con.execute(q + """(o.status='paid' AND o.paid_at>=?) OR (o.status='pending' AND o.provider='demo' AND o.expires>?)
+                                  ORDER BY o.created""", (start - 6 * 3600, now)).fetchall()
         done = con.execute(q + "o.status='served' AND o.served_at>=? ORDER BY o.served_at DESC LIMIT 8", (start,)).fetchall()
-        pend = con.execute("SELECT COUNT(*) FROM orders WHERE status='pending' AND expires>?", (int(time.time()),)).fetchone()[0]
+        pend = con.execute("SELECT COUNT(*) FROM orders WHERE status='pending' AND provider!='demo' AND expires>?", (now,)).fetchone()[0]
         row = lambda o: dict(order_row(o), name=o["name"], group=o["grp"])
         return {"waiting": [row(o) for o in wait], "served": [row(o) for o in done], "pending": pend}
 

@@ -458,7 +458,7 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .size[disabled] { opacity: .5; pointer-events: none; }
 .sizes.gift .size { background: #FBF0DE; border-color: #F0D9B4; }
 .sizes.gift .size span { color: var(--caramel); font-weight: 600; }
-.ready-banner { display: flex; gap: 14px; align-items: center; padding: 16px 18px; border-radius: 22px; background: var(--indigo); color: #fff; box-shadow: 0 18px 36px -20px rgba(36,33,138,.8); }
+.ready-banner { width: 100%; border: 0; font: inherit; text-align: left; cursor: pointer; display: flex; gap: 14px; align-items: center; padding: 16px 18px; border-radius: 22px; background: var(--indigo); color: #fff; box-shadow: 0 18px 36px -20px rgba(36,33,138,.8); }
 .ready-banner .ico { width: 28px; height: 28px; color: var(--foam); }
 .ready-banner b { display: block; font: 800 18px/1.2 var(--f-display); }
 .ready-banner span { opacity: .85; font-size: 14px; }
@@ -522,7 +522,7 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .q-live i { width: 8px; height: 8px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 0 0 rgba(27,112,73,.5); animation: live 2s ease-out infinite; }
 @keyframes live { 70% { box-shadow: 0 0 0 8px rgba(27,112,73,0); } 100% { box-shadow: 0 0 0 0 rgba(27,112,73,0); } }
 .q-list { display: grid; gap: 10px; }
-@media (min-width: 920px) { .q-list { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); } }
+@media (min-width: 920px) { .q-list { grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); } }
 .q-card { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: 14px; border-radius: 20px; background: var(--bg); transition: opacity .35s, transform .35s var(--ease); }
 .q-card.new { animation: qIn .7s var(--spring), qGlow 2.4s ease-out; }
 .q-card.gone { opacity: 0; transform: translateX(30px); }
@@ -536,6 +536,7 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .q-serve { min-height: 48px; padding: 0 18px; }
 .q-serve .ico { width: 18px; height: 18px; }
 .q-empty { margin: 0; color: var(--muted); }
+.q-num .ico { width: 26px; height: 26px; vertical-align: middle; }
 .q-hint { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 999px; background: var(--lilac); color: var(--indigo); font-size: 13px; font-weight: 700; white-space: nowrap; }
 .q-hint .ico { width: 16px; height: 16px; }
 .q-note { margin: 12px 0 0; color: var(--muted); font-size: 13px; }

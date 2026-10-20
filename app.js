@@ -5,6 +5,7 @@
   // Страницы на GitHub Pages ходят в API на сервере; на самом сервере — в тот же адрес.
   const API = location.hostname.endsWith("github.io") ? "https://mukrcoffee.62-113-109-193.sslip.io" : "";
   const QR_PREFIX = "MUKRCOFFEE:";
+  const PICKUP = "MUKRCOFFEE-ORDER:"; // QR заказа: бариста сканирует — заказ подтверждён, баллы начислены
   const MOTION = !matchMedia("(prefers-reduced-motion: reduce)").matches;
   let RULES = { perCup: 10, freeCost: 60, prices: { s: 140, l: 170 } };
   const SLOTS = () => Math.round(RULES.freeCost / RULES.perCup);
@@ -449,9 +450,11 @@
     const more = document.getElementById("more");
     if (more) more.onclick = () => { state.histAll = true; viewStudent(false); };
     $app.querySelectorAll("[data-size]").forEach(b => b.onclick = () => orderCoffee(b.dataset.size, !!b.dataset.free, b));
+    const pk = $app.querySelector("[data-pickup]");
+    if (pk) pk.onclick = () => paySheet(me.order, { onPaid: () => refreshMe() });
     // Вернулись из приложения банка (страница могла перезагрузиться) — снова показываем ожидающий заказ.
     const o = me?.order;
-    if (o && o.status === "pending" && !sheet) paySheet(o, { onPaid: () => refreshMe() });
+    if (o && (o.status === "pending" || o.status === "paid") && !sheet) paySheet(o, { onPaid: () => refreshMe() });
     const card = document.getElementById("myCard");
     countTo(card.querySelector(".pts"), prev, points);
     if (freshFrom !== null) { navigator.vibrate?.(40); toast(`+${pts(points - prev)}. Спасибо за кофе!`); }
@@ -485,8 +488,10 @@
     el.addEventListener("click", e => { if (e.target === el && order.status !== "pending") closeSheet(); });
     sheet = { el, order, opts, timer: 0, tick: 0 };
     drawSheet();
-    if (order.status === "pending") pollOrder();
+    if (live(order)) pollOrder();
   }
+  // Ученик ждёт, пока бариста отсканирует QR: опрашиваем и pending, и оплаченный, но не выданный заказ.
+  const live = o => o.status === "pending" || (o.status === "paid" && !sheet?.opts.desk);
   function closeSheet() {
     if (!sheet) return;
     clearTimeout(sheet.timer); clearInterval(sheet.tick);
@@ -495,7 +500,7 @@
     if (state.user?.role === "student") { try { localStorage.removeItem("mc.order"); } catch {} }
   }
   async function pollOrder() {
-    if (!sheet || sheet.order.status !== "pending") return;
+    if (!sheet || !live(sheet.order)) return;
     const s = sheet;
     try {
       const r = await api("orders/" + s.order.id);
@@ -504,14 +509,14 @@
       s.order = Object.assign(s.order, r.order);
       if (r.order.status !== was) {
         drawSheet();
-        if (r.order.status === "paid") { navigator.vibrate?.([30, 60, 30]); s.opts.onPaid?.(r); }
-        return;
+        if (r.order.status === "paid" || r.order.status === "served") { navigator.vibrate?.([30, 60, 30]); s.opts.onPaid?.(r); }
+        if (!live(s.order)) return;
       }
     } catch {}
     if (sheet === s) s.timer = setTimeout(pollOrder, document.visibilityState === "visible" ? 2000 : 5000);
   }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && sheet?.order.status === "pending") { clearTimeout(sheet.timer); pollOrder(); }
+    if (document.visibilityState === "visible" && sheet && live(sheet.order)) { clearTimeout(sheet.timer); pollOrder(); }
   });
 
   function drawSheet() {
@@ -519,9 +524,25 @@
     clearInterval(sheet.tick);
     const what = `${o.free ? "Бесплатный" : size(o.size)}${o.free ? " " + size(o.size).toLowerCase() : ""} кофе`;
     const close = `<button class="iconbtn sheet-x" data-close aria-label="Закрыть">${ico("x")}</button>`;
-    if (o.status === "pending") {
+    const demo = o.provider === "demo";
+    const bonus = o.free ? "" : ` и +${RULES.perCup} баллов`;
+    // QR заказа, который показывают бариста: в демо — сразу, с банком — после оплаты.
+    const pickup = `<div class="payqr big">${qrOf(o.pickup)}</div>
+        <p class="cap"><b>Покажите этот QR бариста.</b> Заказ подтвердится${bonus} — как только он отсканирует.</p>`;
+    if (o.status === "pending" && demo && !opts.desk) {
+      box.innerHTML = `<div class="grip" aria-hidden="true"></div>
+        <div class="sh-head"><div><b>${what}</b><span>${o.amount} сом · оплата у бариста</span></div></div>
+        <div class="wait"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Ждём, пока бариста отсканирует</span><span class="left" id="left"></span></div>
+        ${pickup}
+        <button class="linkbtn" data-cancel>Отменить заказ</button>`;
+    } else if (o.status === "pending" && demo) {
+      box.innerHTML = `<div class="grip" aria-hidden="true"></div>
+        <div class="sh-head"><div><b>${what}</b><span>${o.amount} сом · ${esc(state.guest?.name || "")}</span></div></div>
+        <p class="cap">Примите оплату и выдайте кофе — баллы начислятся при выдаче.</p>
+        <button class="btn wide" data-hand>${ico("check")}Оплата получена — выдать${bonus ? " · +" + RULES.perCup : ""}</button>
+        <button class="linkbtn" data-cancel>Отменить заказ</button>`;
+    } else if (o.status === "pending") {
       const links = Object.entries(o.appLinks || {}).filter(([, u]) => u);
-      const demo = o.provider === "demo";
       box.innerHTML = `<div class="grip" aria-hidden="true"></div>
         <div class="sh-head"><div><b>${what}</b><span>${o.amount} сом${opts.desk ? " · " + esc(state.guest?.name || "") : ""}</span></div></div>
         <div class="wait"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Ждём оплату</span><span class="left" id="left"></span></div>
@@ -531,19 +552,22 @@
         ${o.qrData ? `<div class="payqr${opts.desk ? " big" : ""}">${qrOf(o.qrData)}</div>
           <p class="cap">${opts.desk ? "Попросите ученика отсканировать код в приложении банка. Баллы начислятся при выдаче." :
             links.length || o.checkoutUrl ? "Платите с другого телефона? Отсканируйте этот код." : "Отсканируйте код в приложении банка."}</p>` : ""}
-        ${demo ? `<p class="demo-note">${ico("gift", 16)}Демо-режим: деньги не списываются, оплата подтвердится сама через несколько секунд. Баллы — только когда бариста отсканирует ваш QR.</p>` : ""}
         <button class="linkbtn" data-cancel>Отменить заказ</button>`;
-      const left = box.querySelector("#left");
-      const upd = () => { const s = Math.max(0, o.expires - Date.now() / 1000); left.textContent = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
-      upd(); sheet.tick = setInterval(upd, 1000);
-    } else if (o.status === "paid" || o.status === "served") {
+    } else if (o.status === "paid" && !opts.desk) {
+      box.innerHTML = `${close}<div class="sh-head"><div><b>${what}</b><span>${o.free ? "за баллы" : "оплачено"} · заказ №${o.num}</span></div></div>
+        <div class="wait"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Ждём, пока бариста отсканирует</span></div>
+        ${pickup}`;
+    } else if (o.status === "paid") {
+      box.innerHTML = `${close}<div class="done"><b>Оплачено</b><div class="num"><span>Заказ</span>№${o.num}</div>
+          <p>Выдайте кофе кнопкой «Выдать» в карточке ученика — тогда начислятся баллы.</p></div>
+        <button class="btn wide" data-close>Готово</button>`;
+    } else if (o.status === "served") {
       box.innerHTML = `${close}<div class="done">
           <svg class="tick" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="29" pathLength="1"/><path d="M19 33l9 9 17-19" pathLength="1"/></svg>
-          <b>${o.free ? "Готово" : "Оплачено"}</b>
+          <b>Отсканировано</b>
           <div class="num"><span>Заказ</span>№${o.num}</div>
-          <p>${opts.desk ? `${o.free ? "Баллы списаны" : "Оплачено"} — выдайте кофе кнопкой «Выдать» в карточке ученика.` :
-            `Подойдите к бариста и покажите свой QR.${o.free ? "" : " +" + RULES.perCup + " баллов придут, когда он его отсканирует."}`}</p>
-          ${o.test ? `<span class="demo">Демо-оплата</span>` : ""}
+          <p>${o.free ? "Бесплатный кофе выдан. Приятного!" : `+${RULES.perCup} баллов на карте. Приятного кофе!`}</p>
+          ${o.test ? `<span class="demo">Демо</span>` : ""}
         </div><button class="btn wide" data-close>Готово</button>`;
     } else {
       const why = { expired: "Время на оплату вышло", cancelled: "Заказ отменён", failed: "Банк не провёл оплату" }[o.status] || "Оплата не прошла";
@@ -551,6 +575,17 @@
         <button class="btn wide" data-close>Понятно</button>`;
     }
     box.querySelectorAll("[data-close]").forEach(b => b.onclick = closeSheet);
+    const left = box.querySelector("#left");
+    if (left) {
+      const upd = () => { const s = Math.max(0, o.expires - Date.now() / 1000); left.textContent = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
+      upd(); sheet.tick = setInterval(upd, 1000);
+    }
+    const hand = box.querySelector("[data-hand]");
+    if (hand) hand.onclick = async () => {
+      hand.disabled = true;
+      try { const r = await scanned(o.pickup); sheet.order = Object.assign(sheet.order, r.order); drawSheet(); }
+      catch { hand.disabled = false; }
+    };
     const c = box.querySelector("[data-cancel]");
     if (c) c.onclick = async () => {
       c.disabled = true;
@@ -575,12 +610,13 @@
 
   function orderBlock(points) {
     const p = RULES.prices, ready = points >= RULES.freeCost, o = state.me?.order;
-    const banner = o && o.status === "paid" ? `<div class="ready-banner">${ico("coffee")}<div><b>Заказ №${o.num} ${o.free ? "готовится" : "оплачен"}</b>
-      <span>${size(o.size)}${o.free ? " · бесплатный" : ""}. Покажите свой QR бариста${o.free ? "" : ` — тогда придут +${RULES.perCup} баллов`}.</span></div></div>` : "";
+    const waits = o && (o.status === "paid" || (o.status === "pending" && o.provider === "demo"));
+    const banner = waits ? `<button class="ready-banner" data-pickup>${ico("qr")}<div><b>${o.num ? `Заказ №${o.num}` : "Заказ"} ждёт бариста</b>
+      <span>${size(o.size)}${o.free ? " · бесплатный" : ""}. Нажмите и покажите QR заказа${o.free ? "" : ` — после сканирования придут +${RULES.perCup} баллов`}.</span></div></button>` : "";
     if (RULES.pay === "off" && !ready) return banner;
     return `${banner}<section class="card order" aria-label="Заказать кофе">
       <div class="card-head"><span>Заказать и оплатить</span>${RULES.pay === "demo" ? `<span class="tag">Демо</span>` : `<span class="tag">${ico("qr", 14)}QR</span>`}</div>
-      ${RULES.pay !== "off" ? `<p class="sub">Оплата в приложении банка. Баллы начислятся, когда бариста отсканирует ваш QR при выдаче.</p>
+      ${RULES.pay !== "off" ? `<p class="sub">${RULES.pay === "demo" ? "Выберите кофе и покажите QR заказа бариста" : "Оплата в приложении банка, потом покажите QR заказа бариста"} — после сканирования придут баллы.</p>
       <div class="sizes">
         <button class="size" data-size="s"><b>Маленький</b><span>${p.s} сом</span></button>
         <button class="size" data-size="l"><b>Большой</b><span>${p.l} сом</span></button>
@@ -676,13 +712,13 @@
         <span class="q-live"><i></i>${q.pending ? `ждут оплату: ${q.pending}` : "онлайн"}</span></div>
       ${q.waiting.length ? `<div class="q-list">${q.waiting.map(o => `
         <article class="q-card${fresh.includes(o.id) ? " new" : ""}${o.free ? " free" : ""}">
-          <div class="q-num">№${o.num}</div>
+          <div class="q-num">${o.num ? "№" + o.num : ico("qr")}</div>
           <div class="q-who"><b>${esc(o.name)}</b><span>${esc(o.group)} · ${size(o.size).toLowerCase()}${o.free ? " · бесплатный" : ` · ${o.amount} сом`}</span>
-            <em>${o.free ? "за баллы" : "оплачено QR"}${o.test ? " · демо" : ""} · ${ago(o.paidAt)}</em></div>
+            <em>${o.free ? "за баллы" : o.status === "pending" ? "оплата у бариста" : "оплачено QR"}${o.test ? " · демо" : ""} · ${ago(o.paidAt || o.created)}</em></div>
           <span class="q-hint">${ico("qr", 16)}Сканируйте QR</span>
         </article>`).join("")}</div>`
-      : `<p class="q-empty">Оплаченных заказов нет. Новые появятся здесь сами — со звуком.</p>`}
-      ${q.waiting.length ? `<p class="q-note">Выдать заказ и начислить баллы можно только после сканирования QR ученика.</p>` : ""}`;
+      : `<p class="q-empty">Заказов нет. Новые появятся здесь сами — со звуком.</p>`}
+      ${q.waiting.length ? `<p class="q-note">Отсканируйте QR заказа на телефоне ученика — заказ подтвердится и баллы начислятся.</p>` : ""}`;
   }
 
   async function startCam() {
@@ -701,7 +737,11 @@
       const w = 480, h = Math.round(v.videoHeight / v.videoWidth * w) || 360;
       c.width = w; c.height = h; ctx.drawImage(v, 0, 0, w, h);
       const r = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: "dontInvert" });
-      if (r && r.data.startsWith(QR_PREFIX)) {
+      if (r && r.data.startsWith(PICKUP)) {
+        busy = true; navigator.vibrate?.(60);
+        vp.classList.remove("hit"); void vp.offsetWidth; vp.classList.add("hit");
+        scanned(r.data).catch(() => {}).finally(() => setTimeout(() => (busy = false), 2500));
+      } else if (r && r.data.startsWith(QR_PREFIX)) {
         busy = true; navigator.vibrate?.(60);
         vp.classList.remove("hit"); void vp.offsetWidth; vp.classList.add("hit");
         lookup(r.data.slice(QR_PREFIX.length)).finally(() => setTimeout(() => (busy = false), 2500));
@@ -712,6 +752,23 @@
   function stopCam() {
     cancelAnimationFrame(cam.raf);
     cam.stream?.getTracks().forEach(t => t.stop()); cam.stream = null;
+  }
+
+  // QR заказа с телефона ученика: сервер подтверждает заказ и начисляет баллы, касса показывает карту.
+  async function scanned(qr) {
+    try {
+      const r = await api("orders/scan", { qr });
+      const isNew = !state.guest || state.guest.code !== r.card.code;
+      const before = isNew ? r.card.points - r.delta : state.guest.points;
+      state.guest = r.card; state.guestOrders = r.orders;
+      renderGuest(r.delta ? { kind: "add" } : null, isNew, before);
+      const g = document.getElementById("guest");
+      if (before < RULES.freeCost && r.card.points >= RULES.freeCost) beans(g);
+      toast(`№${r.order.num} выдан${r.delta ? ` · +${r.delta} — ${r.card.name.split(" ")[0]}` : ""}`);
+      g.scrollIntoView({ behavior: MOTION ? "smooth" : "auto", block: "nearest" });
+      loadQueue(); loadToday();
+      return r;
+    } catch (x) { toast(x.message, true); throw x; }
   }
 
   async function lookup(code) {
