@@ -233,7 +233,8 @@ GOPAY_STATUS = {"COMMITTED": "paid", "FAILED": "failed", "EXPIRED": "expired", "
 
 
 def settle(con, o, new_status, test=False):
-    """Перевести заказ из pending в итоговый статус. Оплата начисляет баллы и даёт номер заказа.
+    """Перевести заказ из pending в итоговый статус. Оплата даёт номер заказа и пишет деньги в выручку,
+    но баллы пока 0 — их начислит бариста, когда отсканирует QR ученика и выдаст заказ (serve_order).
     Повторный вызов (повтор вебхука, параллельный опрос) ничего не меняет."""
     o = con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
     if o["status"] != "pending":
@@ -242,15 +243,12 @@ def settle(con, o, new_status, test=False):
     if new_status != "paid":
         con.execute("UPDATE orders SET status=? WHERE id=?", (new_status, o["id"]))
         return con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
-    r = rules(con)
     num = con.execute("SELECT COUNT(*) FROM orders WHERE paid_at>=?", (day_start(now),)).fetchone()[0] + 1
     con.execute("UPDATE orders SET status='paid', paid_at=?, num=?, test=? WHERE id=?",
                 (now, num, int(test or o["test"]), o["id"]))
-    delta = r["per_cup"]
-    con.execute("UPDATE users SET points=points+? WHERE id=?", (delta, o["user_id"]))
     con.execute("""INSERT INTO ops(user_id,staff_id,kind,size,delta,ts,pay,amount,order_id,test)
                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (o["user_id"], o["staff_id"] or system_id(con), "add", o["size"], delta, now, "qr",
+                (o["user_id"], o["staff_id"] or system_id(con), "add", o["size"], 0, now, "qr",
                  o["amount"], o["id"], int(test or o["test"])))
     return con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
 
@@ -377,11 +375,12 @@ class Handler(BaseHTTPRequestHandler):
         if m == "POST" and len(parts) == 3 and parts[0] == "orders" and parts[2] == "cancel":
             return self.cancel_order(con, self.auth(con), parts[1])
         if m == "POST" and len(parts) == 3 and parts[0] == "orders" and parts[2] == "serve":
-            return self.serve_order(con, self.auth(con, staff=True), parts[1])
+            return self.serve_order(con, self.auth(con, staff=True), parts[1], self.body())
         # --- касса ---
         if m == "GET" and len(parts) == 2 and parts[0] == "card":
             self.auth(con, staff=True)
-            return {"card": public_card(self.card(con, parts[1]))}
+            u = self.card(con, parts[1])
+            return {"card": public_card(u), "orders": self.waiting(con, u)}
         if m == "POST" and len(parts) == 3 and parts[0] == "card" and parts[2] in ("add", "redeem"):
             staff = self.auth(con, staff=True)
             return self.change(con, staff, parts[1], parts[2], self.body())
@@ -409,9 +408,9 @@ class Handler(BaseHTTPRequestHandler):
         return u
 
     def me(self, con, u):
-        ops = con.execute("SELECT * FROM ops WHERE user_id=? AND undone=0 ORDER BY ts DESC LIMIT 30",
+        ops = con.execute("SELECT * FROM ops WHERE user_id=? AND undone=0 AND delta!=0 ORDER BY ts DESC LIMIT 30",
                           (u["id"],)).fetchall()
-        cups = con.execute("SELECT COUNT(*) FROM ops WHERE user_id=? AND kind='add' AND undone=0",
+        cups = con.execute("SELECT COUNT(*) FROM ops WHERE user_id=? AND kind='add' AND undone=0 AND delta>0",
                            (u["id"],)).fetchone()[0]
         free = con.execute("SELECT COUNT(*) FROM ops WHERE user_id=? AND kind='redeem' AND undone=0",
                            (u["id"],)).fetchone()[0]
@@ -574,14 +573,35 @@ class Handler(BaseHTTPRequestHandler):
             o = settle(con, o, "cancelled")
         return {"order": order_row(o)}
 
-    def serve_order(self, con, staff, oid):
+    def waiting(self, con, u):
+        """Оплаченные заказы ученика, которые ждут выдачи, — бариста видит их после сканирования QR."""
+        rows = con.execute("SELECT * FROM orders WHERE user_id=? AND status='paid' ORDER BY paid_at", (u["id"],)).fetchall()
+        return [order_row(o) for o in rows]
+
+    def serve_order(self, con, staff, oid, b):
+        """Выдача только по отсканированному QR ученика: код карты должен совпасть с заказом.
+        Здесь же, а не при оплате, начисляются баллы за стакан."""
         o = self.own_order(con, staff, oid)
-        if o["status"] != "paid":
-            raise ApiError(409, "Этот заказ не ждёт выдачи")
+        code = re.sub(r"[^A-Za-z0-9]", "", str(b.get("code", ""))).upper()
+        u = con.execute("SELECT * FROM users WHERE id=?", (o["user_id"],)).fetchone()
+        if not code:
+            raise ApiError(400, "Сначала отсканируйте QR ученика")
+        if code != u["code"]:
+            raise ApiError(409, "Это QR другого ученика — заказ не его")
+        now = int(time.time())
         with write_lock, con:
+            if con.execute("SELECT status FROM orders WHERE id=?", (o["id"],)).fetchone()["status"] != "paid":
+                raise ApiError(409, "Этот заказ не ждёт выдачи")
             con.execute("UPDATE orders SET status='served', served_at=?, served_by=? WHERE id=?",
-                        (int(time.time()), staff["id"], o["id"]))
-        return {"ok": True}
+                        (now, staff["id"], o["id"]))
+            delta = 0
+            op = con.execute("SELECT * FROM ops WHERE order_id=? AND kind='add' AND undone=0", (o["id"],)).fetchone()
+            if op and op["delta"] == 0:  # заказы, оплаченные до этой версии, баллы уже получили
+                delta = rules(con)["per_cup"]
+                con.execute("UPDATE users SET points=points+? WHERE id=?", (delta, u["id"]))
+                con.execute("UPDATE ops SET delta=?, ts=?, staff_id=? WHERE id=?", (delta, now, staff["id"], op["id"]))
+            u = con.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+        return {"ok": True, "delta": delta, "card": public_card(u), "orders": self.waiting(con, u)}
 
     def gopay_hook(self, con):
         """Вебхук GoPay: и типизированный (events_url), и старый (callback_url). Подпись обязательна."""
@@ -658,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
         money = [r for r in live if r["kind"] == "add" and not r["test"]]
         return {"ops": [dict(op_row(r), name=r["name"], group=r["grp"], code=r["code"], test=bool(r["test"]),
                              canUndo=not r["undone"] and r["pay"] != "qr" and time.time() - r["ts"] <= UNDO_WINDOW)
-                        for r in rows],
+                        for r in rows if r["delta"]],  # оплачен, но ещё не выдан — в ленте не показываем
                 "sold": sum(1 for r in live if r["kind"] == "add"),
                 "free": sum(1 for r in live if r["kind"] == "redeem"),
                 "revenue": sum(r["amount"] for r in money),

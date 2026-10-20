@@ -536,7 +536,12 @@ button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
 .q-serve { min-height: 48px; padding: 0 18px; }
 .q-serve .ico { width: 18px; height: 18px; }
 .q-empty { margin: 0; color: var(--muted); }
-@media (max-width: 480px) { .q-card { grid-template-columns: auto 1fr; } .q-serve { grid-column: 1 / -1; } }
+.q-hint { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 999px; background: var(--lilac); color: var(--indigo); font-size: 13px; font-weight: 700; white-space: nowrap; }
+.q-hint .ico { width: 16px; height: 16px; }
+.q-note { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
+.serve { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; margin: 14px 0; padding: 12px; border-radius: 20px; background: #FBF0DE; border: 1.5px solid #F0D9B4; }
+.serve .q-num { font-size: 20px; min-width: 56px; }
+@media (max-width: 480px) { .q-card, .serve { grid-template-columns: auto 1fr; } .q-serve, .q-hint { grid-column: 1 / -1; justify-content: center; } }
 
 .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; border-radius: 999px; background: var(--lilac); }
 .seg button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 42px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font-weight: 600; font-size: 14px; transition: background .3s, color .3s, box-shadow .3s; }

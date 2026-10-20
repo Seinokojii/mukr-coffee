@@ -14,7 +14,7 @@
     get tok() { try { return localStorage.getItem("mc.tok") || ""; } catch { return ""; } },
     set tok(v) { try { v ? localStorage.setItem("mc.tok", v) : localStorage.removeItem("mc.tok"); } catch {} },
   };
-  let state = { user: null, me: null, guest: null, today: null, lastPts: null, lastOp: 0 };
+  let state = { user: null, me: null, guest: null, guestOrders: [], today: null, lastPts: null, lastOp: 0 };
   let pollTimer = null;
   let viewId = 0; // меняется при смене экрана — останавливает петли старого экрана
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -529,9 +529,9 @@
           <div class="banks">${links.map(([k, u]) => `<a class="bank" href="${esc(u)}">${ico("out", 18)}${esc(bankName(k))}</a>`).join("")}</div>` : ""}
         ${!opts.desk && o.checkoutUrl ? `<a class="btn soft wide" href="${esc(o.checkoutUrl)}" target="_blank" rel="noopener">Все банки и Элкарт</a>` : ""}
         ${o.qrData ? `<div class="payqr${opts.desk ? " big" : ""}">${qrOf(o.qrData)}</div>
-          <p class="cap">${opts.desk ? "Попросите ученика отсканировать код в приложении банка. Баллы придут сами." :
+          <p class="cap">${opts.desk ? "Попросите ученика отсканировать код в приложении банка. Баллы начислятся при выдаче." :
             links.length || o.checkoutUrl ? "Платите с другого телефона? Отсканируйте этот код." : "Отсканируйте код в приложении банка."}</p>` : ""}
-        ${demo ? `<p class="demo-note">${ico("gift", 16)}Демо-режим: деньги не списываются, оплата подтвердится сама через несколько секунд.</p>` : ""}
+        ${demo ? `<p class="demo-note">${ico("gift", 16)}Демо-режим: деньги не списываются, оплата подтвердится сама через несколько секунд. Баллы — только когда бариста отсканирует ваш QR.</p>` : ""}
         <button class="linkbtn" data-cancel>Отменить заказ</button>`;
       const left = box.querySelector("#left");
       const upd = () => { const s = Math.max(0, o.expires - Date.now() / 1000); left.textContent = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
@@ -541,8 +541,8 @@
           <svg class="tick" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="29" pathLength="1"/><path d="M19 33l9 9 17-19" pathLength="1"/></svg>
           <b>${o.free ? "Готово" : "Оплачено"}</b>
           <div class="num"><span>Заказ</span>№${o.num}</div>
-          <p>${opts.desk ? `${o.free ? "Баллы списаны" : "+" + RULES.perCup + " баллов на карте"} — заказ в очереди на выдачу.` :
-            `${o.free ? "" : "+" + RULES.perCup + " баллов уже на карте. "}Подойдите к бариста и назовите номер.`}</p>
+          <p>${opts.desk ? `${o.free ? "Баллы списаны" : "Оплачено"} — выдайте кофе кнопкой «Выдать» в карточке ученика.` :
+            `Подойдите к бариста и покажите свой QR.${o.free ? "" : " +" + RULES.perCup + " баллов придут, когда он его отсканирует."}`}</p>
           ${o.test ? `<span class="demo">Демо-оплата</span>` : ""}
         </div><button class="btn wide" data-close>Готово</button>`;
     } else {
@@ -576,11 +576,11 @@
   function orderBlock(points) {
     const p = RULES.prices, ready = points >= RULES.freeCost, o = state.me?.order;
     const banner = o && o.status === "paid" ? `<div class="ready-banner">${ico("coffee")}<div><b>Заказ №${o.num} ${o.free ? "готовится" : "оплачен"}</b>
-      <span>${size(o.size)}${o.free ? " · бесплатный" : ""}. Назовите номер бариста.</span></div></div>` : "";
+      <span>${size(o.size)}${o.free ? " · бесплатный" : ""}. Покажите свой QR бариста${o.free ? "" : ` — тогда придут +${RULES.perCup} баллов`}.</span></div></div>` : "";
     if (RULES.pay === "off" && !ready) return banner;
     return `${banner}<section class="card order" aria-label="Заказать кофе">
       <div class="card-head"><span>Заказать и оплатить</span>${RULES.pay === "demo" ? `<span class="tag">Демо</span>` : `<span class="tag">${ico("qr", 14)}QR</span>`}</div>
-      ${RULES.pay !== "off" ? `<p class="sub">Оплата в приложении банка — баллы и номер заказа придут сразу.</p>
+      ${RULES.pay !== "off" ? `<p class="sub">Оплата в приложении банка. Баллы начислятся, когда бариста отсканирует ваш QR при выдаче.</p>
       <div class="sizes">
         <button class="size" data-size="s"><b>Маленький</b><span>${p.s} сом</span></button>
         <button class="size" data-size="l"><b>Большой</b><span>${p.l} сом</span></button>
@@ -679,14 +679,10 @@
           <div class="q-num">№${o.num}</div>
           <div class="q-who"><b>${esc(o.name)}</b><span>${esc(o.group)} · ${size(o.size).toLowerCase()}${o.free ? " · бесплатный" : ` · ${o.amount} сом`}</span>
             <em>${o.free ? "за баллы" : "оплачено QR"}${o.test ? " · демо" : ""} · ${ago(o.paidAt)}</em></div>
-          <button class="btn q-serve" data-serve="${o.id}">${ico("check")}Выдан</button>
+          <span class="q-hint">${ico("qr", 16)}Сканируйте QR</span>
         </article>`).join("")}</div>`
-      : `<p class="q-empty">Оплаченных заказов нет. Новые появятся здесь сами — со звуком.</p>`}`;
-    el.querySelectorAll("[data-serve]").forEach(b => b.onclick = async () => {
-      b.disabled = true;
-      try { await api(`orders/${b.dataset.serve}/serve`, {}); b.closest(".q-card").classList.add("gone"); setTimeout(loadQueue, 380); }
-      catch (x) { toast(x.message, true); b.disabled = false; }
-    });
+      : `<p class="q-empty">Оплаченных заказов нет. Новые появятся здесь сами — со звуком.</p>`}
+      ${q.waiting.length ? `<p class="q-note">Выдать заказ и начислить баллы можно только после сканирования QR ученика.</p>` : ""}`;
   }
 
   async function startCam() {
@@ -720,9 +716,9 @@
 
   async function lookup(code) {
     try {
-      const card = (await api("card/" + code)).card;
+      const { card, orders } = await api("card/" + code);
       const isNew = !state.guest || state.guest.code !== card.code;
-      state.guest = card; renderGuest(null, isNew);
+      state.guest = card; state.guestOrders = orders || []; renderGuest(null, isNew);
       document.getElementById("guest").scrollIntoView({ behavior: MOTION ? "smooth" : "auto", block: "nearest" });
     } catch (x) { toast(x.message, true); }
   }
@@ -739,6 +735,11 @@
         <button class="iconbtn" id="gx" aria-label="Закрыть карту">${ico("x")}</button></div>
       ${ptsHtml(prevPts ?? g.points)}
       ${stampCard(g.points, { row: true, desk: true, freshFrom })}
+      ${(state.guestOrders || []).map(o => `<div class="serve">
+        <div class="q-num">№${o.num}</div>
+        <div class="q-who"><b>${size(o.size)}${o.free ? " · бесплатный" : ""}</b><span>${o.free ? "за баллы" : `оплачено QR · ${o.amount} сом`}${o.test ? " · демо" : ""}</span></div>
+        <button class="btn q-serve" data-serve="${o.id}">${ico("check")}Выдать${o.free ? "" : ` · +${RULES.perCup}`}</button>
+      </div>`).join("")}
       ${RULES.pay !== "off" ? `<div class="seg" role="radiogroup" aria-label="Способ оплаты">
         <button role="radio" aria-checked="${!qr}" data-payby="cash">Наличные или терминал</button>
         <button role="radio" aria-checked="${qr}" data-payby="qr">${ico("qr", 16)}QR на экране</button></div>` : ""}
@@ -751,7 +752,19 @@
       ${can ? "" : `<p class="sub">Бесплатный кофе откроется на ${RULES.freeCost} баллах.</p>`}
     </div>`;
     countTo(el.querySelector(".pts"), prevPts, g.points, 500);
-    document.getElementById("gx").onclick = () => { state.guest = null; renderGuest(); };
+    document.getElementById("gx").onclick = () => { state.guest = null; state.guestOrders = []; renderGuest(); };
+    el.querySelectorAll("[data-serve]").forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      const before = g.points;
+      try {
+        const r = await api(`orders/${b.dataset.serve}/serve`, { code: g.code });
+        state.guest = r.card; state.guestOrders = r.orders;
+        renderGuest(r.delta ? { kind: "add" } : null, false, before);
+        if (before < RULES.freeCost && r.card.points >= RULES.freeCost) beans(el);
+        toast(r.delta ? `Выдан · +${r.delta} — ${g.name.split(" ")[0]}` : "Заказ выдан");
+        loadQueue(); loadToday();
+      } catch (x) { toast(x.message, true); b.disabled = false; }
+    });
     el.querySelectorAll("[data-payby]").forEach(b => b.onclick = () => { state.payBy = b.dataset.payby; renderGuest(); });
     el.querySelectorAll(".act").forEach(b => b.onclick = async e => {
       ripple(b, e);
@@ -1017,7 +1030,7 @@
   async function logout() {
     stopCam(); clearInterval(pollTimer);
     try { await api("logout", {}); } catch {}
-    store.tok = ""; state = { user: null, me: null, guest: null, today: null, lastPts: null, lastOp: 0 };
+    store.tok = ""; state = { user: null, me: null, guest: null, guestOrders: [], today: null, lastPts: null, lastOp: 0 };
     render();
   }
 

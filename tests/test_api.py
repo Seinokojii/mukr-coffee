@@ -40,18 +40,22 @@ BOSS = call("login", {"phone": "boss", "password": "bosspass1"})[1]["token"]
 
 
 class Api(unittest.TestCase):
-    def test_demo_order_pays_and_credits_points(self):
-        tok, _ = student("0700000001")
+    def test_paid_order_credits_only_after_scan(self):
+        tok, code = student("0700000001")
         st, r = call("orders", {"size": "l"}, tok)
         self.assertEqual(st, 200)
         o = r["order"]
         self.assertEqual((o["status"], o["amount"]), ("pending", 170))
         st, r = call(f"orders/{o['id']}", tok=tok)
         self.assertEqual(r["order"]["status"], "paid")
-        self.assertEqual(r["points"], 10)
+        self.assertEqual(r["points"], 0)  # оплачено, но бариста ещё не сканировал
         self.assertTrue(r["order"]["num"] >= 1)
-        # Повторный опрос не начисляет второй раз.
-        call(f"orders/{o['id']}", tok=tok)
+        self.assertEqual(call("me", tok=tok)[1]["history"], [])
+        # После сканирования карта показывает заказ, выдача начисляет баллы один раз.
+        self.assertEqual([x["id"] for x in call(f"card/{code}", tok=BAR)[1]["orders"]], [o["id"]])
+        st, r = call(f"orders/{o['id']}/serve", {"code": code}, BAR)
+        self.assertEqual((st, r["delta"], r["card"]["points"], r["orders"]), (200, 10, 10, []))
+        self.assertEqual(call(f"orders/{o['id']}/serve", {"code": code}, BAR)[0], 409)
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 10)
 
     def test_other_student_cannot_see_order(self):
@@ -61,21 +65,26 @@ class Api(unittest.TestCase):
         self.assertEqual(call(f"orders/{oid}", tok=tok2)[0], 404)
 
     def test_queue_and_serve(self):
-        tok, _ = student("0700000004")
+        tok, code = student("0700000004")
         oid = call("orders", {"size": "s"}, tok)[1]["order"]["id"]
         call(f"orders/{oid}", tok=tok)
         q = call("queue", tok=BAR)[1]
         self.assertIn(oid, [o["id"] for o in q["waiting"]])
-        self.assertEqual(call(f"orders/{oid}/serve", {}, BAR)[0], 200)
+        self.assertEqual(call(f"orders/{oid}/serve", {}, BAR)[0], 400)  # без сканирования QR нельзя
+        _, other = student("0700000014")
+        self.assertEqual(call(f"orders/{oid}/serve", {"code": other}, BAR)[0], 409)  # чужой QR
+        self.assertEqual(call(f"orders/{oid}/serve", {"code": code}, tok)[0], 403)  # ученик не выдаёт
+        self.assertEqual(call(f"orders/{oid}/serve", {"code": code}, BAR)[0], 200)
         q = call("queue", tok=BAR)[1]
         self.assertNotIn(oid, [o["id"] for o in q["waiting"]])
-        self.assertEqual(call(f"orders/{oid}/serve", {}, tok)[0], 403)  # ученик не выдаёт
 
     def test_desk_order_for_card(self):
         tok, code = student("0700000005")
         st, r = call("orders", {"size": "s", "code": code}, BAR)
         self.assertEqual((st, r["order"]["via"]), (200, "desk"))
         call(f"orders/{r['order']['id']}", tok=BAR)
+        self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 0)
+        call(f"orders/{r['order']['id']}/serve", {"code": code}, BAR)
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 10)
 
     def test_free_order_spends_points(self):
@@ -134,8 +143,9 @@ class GoPayHook(unittest.TestCase):
         self.assertEqual(self.hook(ev)[0], 200)
         self.assertEqual(self.hook(ev)[0], 200)  # повтор доставки
         me = call("me", tok=tok)[1]
-        self.assertEqual(me["user"]["points"], 10)
+        self.assertEqual(me["user"]["points"], 0)  # баллы — только при выдаче
         self.assertEqual(me["order"]["status"], "paid")
+        self.assertEqual(call("admin/stats?days=1&test=1", tok=BOSS)[1]["qr"] >= 140, True)  # деньги в выручке сразу
 
     def test_bad_signature_rejected(self):
         tok, oid, ext = self.make_pending()
@@ -152,7 +162,7 @@ class GoPayHook(unittest.TestCase):
     def test_legacy_callback_format(self):
         tok, oid, ext = self.make_pending()
         self.assertEqual(self.hook({"order_id": ext, "status": "COMMITTED", "amount": "140.00"})[0], 200)
-        self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 10)
+        self.assertEqual(call("me", tok=tok)[1]["order"]["status"], "paid")
 
 
 class GoPayCreate(unittest.TestCase):
@@ -184,7 +194,7 @@ class GoPayCreate(unittest.TestCase):
         with S.db() as con:  # «прошло» 6 секунд — сервер сам спросит статус у GoPay
             con.execute("UPDATE orders SET created=created-6 WHERE id=?", (o["id"],))
         st, r = call(f"orders/{o['id']}", tok=tok)
-        self.assertEqual((r["order"]["status"], r["points"]), ("paid", 10))
+        self.assertEqual((r["order"]["status"], r["points"]), ("paid", 0))
         self.assertEqual(self.calls[-1][0], "/v1/payments/query")
 
 
