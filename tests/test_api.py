@@ -1,15 +1,14 @@
 """Проверка API на временной базе: python3 -m unittest discover -s tests"""
 import json, os, sys, tempfile, threading, time, unittest, urllib.error, urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 TMP = tempfile.mkdtemp()
-os.environ.update(DB_PATH=str(Path(TMP) / "t.db"), PAY_MODE="demo")
+os.environ.update(DB_PATH=str(Path(TMP) / "t.db"), PAY_MODE="desk")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import server as S  # noqa: E402
 
 S.init_db()
-HTTPD = ThreadingHTTPServer(("127.0.0.1", 0), S.Handler)
+HTTPD = S.PoolServer(("127.0.0.1", 0), S.Handler, workers=8)
 BASE = f"http://127.0.0.1:{HTTPD.server_address[1]}/api/"
 threading.Thread(target=HTTPD.serve_forever, daemon=True).start()
 
@@ -40,26 +39,30 @@ BOSS = call("login", {"phone": "boss", "password": "bosspass1"})[1]["token"]
 
 
 class Api(unittest.TestCase):
-    def test_demo_order_waits_for_barista_scan(self):
-        tok, _ = student("0700000001")
+    def test_desk_order_waits_for_scan_and_payment(self):
+        tok, code = student("0700000001")
         st, r = call("orders", {"size": "l"}, tok)
         self.assertEqual(st, 200)
         o = r["order"]
         self.assertEqual((o["status"], o["amount"]), ("pending", 170))
-        self.assertTrue(o["pickup"].startswith(S.PICKUP))
         time.sleep(0.1)
         st, r = call(f"orders/{o['id']}", tok=tok)
         self.assertEqual(r["order"]["status"], "pending")  # сам не подтверждается
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 0)
         self.assertIn(o["id"], [x["id"] for x in call("queue", tok=BAR)[1]["waiting"]])
-        self.assertEqual(call("orders/scan", {"qr": o["pickup"]}, tok)[0], 403)  # ученик сам себе не сканирует
-        st, r = call("orders/scan", {"qr": o["pickup"]}, BAR)
-        self.assertEqual((st, r["delta"], r["card"]["points"], r["order"]["status"]), (200, 10, 10, "served"))
+        self.assertEqual(call("orders/scan", {"qr": S.CARD_QR + code}, tok)[0], 403)  # ученик сам себе не сканирует
+        # Скан личного QR показывает заказ, но ничего не меняет.
+        st, r = call("orders/scan", {"qr": S.CARD_QR + code}, BAR)
+        self.assertEqual((st, [x["id"] for x in r["orders"]], r["card"]["points"]), (200, [o["id"]], 0))
+        self.assertEqual(call(f"orders/{o['id']}/serve", {"code": code}, BAR)[0], 400)  # без способа оплаты нельзя
+        st, r = call(f"orders/{o['id']}/serve", {"code": code, "pay": "card"}, BAR)
+        self.assertEqual((st, r["delta"], r["card"]["points"], r["order"]["status"], r["orders"]), (200, 10, 10, "served", []))
         self.assertTrue(r["order"]["num"] >= 1)
-        self.assertEqual(call("orders/scan", {"qr": o["pickup"]}, BAR)[0], 409)  # второй раз — нет
+        self.assertEqual(call(f"orders/{o['id']}/serve", {"code": code, "pay": "card"}, BAR)[0], 409)  # второй раз — нет
         st, r = call(f"orders/{o['id']}", tok=tok)
         self.assertEqual((r["order"]["status"], r["points"]), ("served", 10))
-        self.assertEqual(call("orders/scan", {"qr": "MUKRCOFFEE-ORDER:nope"}, BAR)[0], 404)
+        self.assertEqual(call("today", tok=BAR)[1]["card"] >= 170, True)  # деньги картой в кассе дня
+        self.assertEqual(call("orders/scan", {"qr": "MUKRCOFFEE:NOPE"}, BAR)[0], 404)
 
     def test_other_student_cannot_see_order(self):
         tok, _ = student("0700000002")
@@ -87,7 +90,7 @@ class Api(unittest.TestCase):
         st, r = call("orders", {"size": "s", "code": code}, BAR)
         self.assertEqual((st, r["order"]["via"]), (200, "desk"))
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 0)
-        call("orders/scan", {"qr": r["order"]["pickup"]}, BAR)
+        call(f"orders/{r['order']['id']}/serve", {"code": code, "pay": "cash"}, BAR)
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 10)
 
     def test_free_order_spends_points(self):
@@ -98,8 +101,32 @@ class Api(unittest.TestCase):
         self.assertEqual((st, r["order"]["status"], r["order"]["amount"]), (200, "paid", 0))
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 0)
         self.assertEqual(call("orders", {"size": "l", "free": True}, tok)[0], 409)
-        self.assertEqual(call("orders/scan", {"qr": r["order"]["pickup"]}, BAR)[1]["order"]["status"], "served")
+        st, rr = call(f"orders/{r['order']['id']}/serve", {"code": code}, BAR)  # за баллы — без отметки оплаты
+        self.assertEqual((st, rr["order"]["status"], rr["delta"]), (200, "served", 0))
         self.assertEqual(call("me", tok=tok)[1]["user"]["points"], 0)
+
+    def test_admin_students(self):
+        tok, code = student("0700000021")
+        r = call("admin/students?q=0700000021", tok=BOSS)[1]
+        self.assertEqual([x["code"] for x in r["students"]], [code])
+        self.assertEqual(call("admin/students", tok=BAR)[0], 403)
+        sid = r["students"][0]["id"]
+        pw = call(f"admin/students/{sid}/reset", {}, BOSS)[1]["password"]
+        self.assertEqual(call("me", tok=tok)[0], 401)  # старые сессии закрыты
+        self.assertEqual(call("login", {"phone": "0700000021", "password": pw})[0], 200)
+
+    def test_limits_and_hardening(self):
+        self.assertEqual(call("register", {"name": "Бот Ботов", "group": "X", "phone": "0700000031",
+                                           "password": "secret1", "website": "spam"})[0], 400)  # ловушка для ботов
+        self.assertEqual(call("login", raw=b"x" * 30_000)[0], 413)
+        tok, _ = student("0700000032")
+        codes = [call("me", tok=tok)[0] for _ in range(40)]
+        self.assertIn(429, codes)  # одна сессия не может засыпать сервер запросами
+        S.LIM_SESSION.b.clear()
+        for _ in range(11):
+            call("login", {"phone": "0700000032", "password": "wrong-pass"})
+        self.assertEqual(call("login", {"phone": "0700000032", "password": "secret1"})[0], 429)  # перебор пароля
+        S.LIM_LOGIN_ACC.b.clear()
 
     def test_admin_only(self):
         self.assertEqual(call("admin/stats", tok=BAR)[0], 403)
@@ -118,6 +145,60 @@ class Api(unittest.TestCase):
         st, r = call("admin/settings", {"price_s": 150, "price_l": 180, "per_cup": 10, "free_cost": 60}, BOSS)
         self.assertEqual((st, r["prices"]["s"]), (200, 150))
         call("admin/settings", {"price_s": 140, "price_l": 170, "per_cup": 10, "free_cost": 60}, BOSS)
+
+
+class Hardening(unittest.TestCase):
+    def test_slow_body_is_cut(self):
+        """Тело по байту раз в секунду: сервер рвёт соединение по общему сроку, а не ждёт вечно."""
+        import socket
+        S.BODY_DEADLINE, saved = 1.5, S.BODY_DEADLINE
+        try:
+            c = socket.create_connection(("127.0.0.1", HTTPD.server_address[1]))
+            c.sendall(b"POST /api/login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n")
+            t0 = time.time()
+            c.settimeout(0.6)
+            got = b""
+            while time.time() - t0 < 6 and not got:
+                try:
+                    c.sendall(b"{")
+                    got = c.recv(200)
+                except socket.timeout:
+                    pass
+                except OSError:
+                    break
+            self.assertLess(time.time() - t0, 5)
+            self.assertIn(b"408", got)
+            c.close()
+        finally:
+            S.BODY_DEADLINE = saved
+
+    def test_chunked_rejected(self):
+        st, _ = call("login", raw=b"5\r\nhello\r\n0\r\n\r\n", headers={"Transfer-Encoding": "chunked"})
+        self.assertIn(st, (400, 411))
+
+    def test_fake_token_counts_to_ip_limit(self):
+        S.LIM_IP.b.clear()
+        codes = [call("me", tok="x" * 40)[0] for _ in range(200)]
+        self.assertIn(429, codes)
+        S.LIM_IP.b.clear()
+
+    def test_staff_login_refused_from_pages(self):
+        st, r = call("login", {"phone": "bar", "password": "barpass1"}, headers={"Origin": "https://seinokojii.github.io"})
+        self.assertEqual(st, 403)
+
+    def test_barista_cannot_undo_redeem_or_order(self):
+        tok, code = student("0700000041")
+        for _ in range(6):
+            call(f"card/{code}/add", {"size": "s"}, BAR)
+        op = call(f"card/{code}/redeem", {"size": "s"}, BAR)[1]["op"]
+        self.assertEqual(call(f"op/{op['id']}/undo", {}, BAR)[0], 409)  # бесплатный кофе не «вернуть» бариста
+        oid = call("orders", {"size": "l"}, tok)[1]["order"]["id"]
+        call(f"orders/{oid}/serve", {"code": code, "pay": "cash"}, BAR)
+        ops = call("today", tok=BAR)[1]["ops"]
+        linked = [o for o in ops if o["name"] == "Тест Студент" and o["kind"] == "add" and not o["canUndo"]]
+        self.assertTrue(linked)
+        self.assertEqual(call(f"op/{linked[0]['id']}/undo", {}, BAR)[0], 409)  # продажа по заказу — только админ
+        self.assertEqual(call(f"op/{op['id']}/undo", {}, BOSS)[0], 200)
 
 
 class GoPayHook(unittest.TestCase):
@@ -151,6 +232,19 @@ class GoPayHook(unittest.TestCase):
         self.assertEqual(me["user"]["points"], 0)  # баллы — только при выдаче
         self.assertEqual(me["order"]["status"], "paid")
         self.assertEqual(call("admin/stats?days=1&test=1", tok=BOSS)[1]["qr"] >= 140, True)  # деньги в выручке сразу
+
+    def test_late_payment_of_closed_order_is_kept(self):
+        tok, oid, ext = self.make_pending()
+        with S.db() as con:
+            con.execute("UPDATE orders SET status='expired' WHERE id=?", (oid,))
+        ev = {"event": "payment.committed", "data": {"order_id": ext, "status": "COMMITTED", "amount": "140.00"}}
+        self.assertEqual(self.hook(ev)[0], 200)
+        self.assertEqual(call("me", tok=tok)[1]["order"]["status"], "paid")  # деньги не пропали
+
+    def test_amount_must_match_exactly(self):
+        tok, oid, ext = self.make_pending()
+        ev = {"event": "payment.committed", "data": {"order_id": ext, "status": "COMMITTED", "amount": "140.99"}}
+        self.assertEqual(self.hook(ev)[0], 409)
 
     def test_bad_signature_rejected(self):
         tok, oid, ext = self.make_pending()

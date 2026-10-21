@@ -2,20 +2,26 @@
 (() => {
   "use strict";
 
-  // Страницы на GitHub Pages ходят в API на сервере; на самом сервере — в тот же адрес.
-  const API = location.hostname.endsWith("github.io") ? "https://mukrcoffee.62-113-109-193.sslip.io" : "";
-  const QR_PREFIX = "MUKRCOFFEE:";
-  const PICKUP = "MUKRCOFFEE-ORDER:"; // QR заказа: бариста сканирует — заказ подтверждён, баллы начислены
+  // Карта живёт только на сервере кофейни: на github.io общий для всех проектов localStorage,
+  // и токен кассы там мог бы прочитать чужой скрипт. Старая ссылка просто переводит сюда.
+  const HOME = "https://mukrcoffee.62-113-109-193.sslip.io/";
+  if (location.hostname.endsWith("github.io")) { location.replace(HOME + location.hash); return; }
+  const API = "";
+  const QR_PREFIX = "MUKRCOFFEE:";        // личный QR ученика — один на всё: и штамп, и выдача заказа
+  const PICKUP = "MUKRCOFFEE-ORDER:";     // QR заказа из прошлых версий — касса его тоже понимает
   const MOTION = !matchMedia("(prefers-reduced-motion: reduce)").matches;
-  let RULES = { perCup: 10, freeCost: 60, prices: { s: 140, l: 170 } };
+  let RULES = { perCup: 10, freeCost: 60, prices: { s: 140, l: 170 }, pay: "desk" };
   const SLOTS = () => Math.round(RULES.freeCost / RULES.perCup);
+  const DESK = p => p === "desk" || p === "demo";
 
   const $app = document.getElementById("app");
-  const store = {
-    get tok() { try { return localStorage.getItem("mc.tok") || ""; } catch { return ""; } },
-    set tok(v) { try { v ? localStorage.setItem("mc.tok", v) : localStorage.removeItem("mc.tok"); } catch {} },
+  const ls = {
+    get: k => { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+    set: (k, v) => { try { v ? localStorage.setItem(k, v) : localStorage.removeItem(k); } catch {} },
   };
-  let state = { user: null, me: null, guest: null, guestOrders: [], today: null, lastPts: null, lastOp: 0 };
+  const store = { get tok() { return ls.get("mc.tok"); }, set tok(v) { ls.set("mc.tok", v); } };
+  const fresh = () => ({ user: null, me: null, guest: null, guestOrders: [], today: null, lastPts: null, lastOp: 0 });
+  let state = fresh();
   let pollTimer = null;
   let viewId = 0; // меняется при смене экрана — останавливает петли старого экрана
   const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -27,11 +33,17 @@
     camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
     undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
     x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
-    max: '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
     gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C9.5 3 12 8 12 8s2.5-5 4.5-5a2.5 2.5 0 0 1 0 5"/>',
     userPlus: '<path d="M2 21a8 8 0 0 1 13.292-6"/><circle cx="10" cy="8" r="5"/><path d="M19 16v6"/><path d="M22 19h-6"/>',
     qr: '<rect width="5" height="5" x="3" y="3" rx="1"/><rect width="5" height="5" x="16" y="3" rx="1"/><rect width="5" height="5" x="3" y="16" rx="1"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/><path d="M21 21v.01"/><path d="M12 7v3a2 2 0 0 1-2 2H7"/><path d="M3 12h.01"/><path d="M12 3h.01"/><path d="M12 16v.01"/><path d="M16 12h1"/><path d="M21 12v.01"/><path d="M12 21v-1"/>',
     check: '<path d="M20 6 9 17l-5-5"/>',
+    cash: '<rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/>',
+    card: '<rect width="20" height="14" x="2" y="5" rx="2"/><path d="M2 10h20"/>',
+    search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    flip: '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>',
+    key: '<path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4"/><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/>',
+    down: '<path d="m6 9 6 6 6-6"/>',
   };
   const ico = (n, s = 20) => `<svg class="ico" width="${s}" height="${s}" viewBox="0 0 24 24" aria-hidden="true">${P[n]}</svg>`;
 
@@ -62,17 +74,17 @@
     <g class="cup"><path pathLength="1" d="M84 127H116V137a13 13 0 0 1-13 13H97a13 13 0 0 1-13-13Z"/><path pathLength="1" d="M116 130h3.5a5 5 0 0 1 0 10H116"/><path pathLength="1" d="M78 156H122"/></g>
   </svg>`;
 
-  // Оттиск на карте — печать МУКР: кольцо, надпись по кругу, башня. Цвет чернил — currentColor.
+  // Оттиск на карте — печать МУКР: кольцо, надпись по кругу, башня. Цвет чернил — currentColor, прорези — цвет бумаги.
   let stampId = 0;
-  const stamp = () => {
+  const stamp = (paper = "#FFFFFF") => {
     const id = "arc" + (++stampId);
-    return `<svg class="st" viewBox="0 0 100 100" aria-hidden="true">
+    return `<svg class="stp" viewBox="0 0 100 100" aria-hidden="true">
       <defs><path id="${id}" d="M50 50 m-40 0 a40 40 0 1 1 80 0 a40 40 0 1 1 -80 0"/></defs>
       <circle cx="50" cy="50" r="47" fill="none" stroke="currentColor" stroke-width="3.5"/>
       <circle cx="50" cy="50" r="33" fill="none" stroke="currentColor" stroke-width="1.6"/>
       <text font-family="JetBrains Mono, monospace" font-size="8.6" font-weight="700" fill="currentColor" textLength="246" lengthAdjust="spacing">
         <textPath href="#${id}">МУКР · КОФЕ · 1993 · МУКР · КОФЕ · 1993 ·</textPath></text>
-      ${tower("translate(36.2 23.4) scale(.46)", "currentColor", "#FFFFFF")}
+      ${tower("translate(36.2 23.4) scale(.46)", "currentColor", paper)}
     </svg>`;
   };
   const brandMark = () => `<svg viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="31" fill="#F1D3A1"/><circle cx="32" cy="32" r="26" fill="#16006F"/>${tower("translate(20.6 10.5) scale(.38)", "#fff", "#16006F")}</svg>`;
@@ -81,7 +93,7 @@
     <ellipse cx="38" cy="17" rx="17" ry="15" fill="#F1D3A1"/><ellipse cx="33" cy="12" rx="6" ry="4" fill="#FFF1D6"/>
     <rect x="31" y="28" width="14" height="30" rx="4" fill="#F1D3A1"/>
     <rect x="8" y="56" width="60" height="32" rx="8" fill="#0F0A3C"/><rect x="8" y="56" width="60" height="8" rx="4" fill="#2A2A9E"/>
-    <rect x="12" y="88" width="52" height="14" rx="4" fill="#16006F"/></svg>`;
+    <rect x="12" y="88" width="52" height="14" rx="4" fill="#F1D3A1"/></svg>`;
   const beanSvg = c => `<svg viewBox="0 0 16 22" width="16" height="22"><ellipse cx="8" cy="11" rx="7" ry="10" fill="${c}"/><path d="M8 2c-3.5 5 3.5 13 0 18" stroke="rgba(0,0,0,.35)" stroke-width="1.6" fill="none"/></svg>`;
 
   // ---------- помощники ----------
@@ -95,12 +107,15 @@
   const cups = n => `${n} ${plural(n, "стакан", "стакана", "стаканов")}`;
   const size = s => (s === "l" ? "Большой" : "Маленький");
   const fmtCode = c => (c || "").replace(/(.{4})(.{4})/, "$1-$2");
+  const fmtSom = n => Number(n || 0).toLocaleString("ru-RU").replace(/,/g, " ");
+  const first = n => esc(String(n || "").split(" ")[0]);
   const fmtTime = ts => {
     const d = new Date(ts * 1000), now = new Date();
     const t = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
     if (d.toDateString() === now.toDateString()) return "сегодня, " + t;
     return d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" }) + ", " + t;
   };
+  const ago = ts => { const m = Math.max(0, Math.floor((Date.now() / 1000 - ts) / 60)); return m < 1 ? "только что" : m + " мин назад"; };
   const rot = i => [-9, 6, -3, 11, -7, 4][i % 6] + "deg";
 
   let toastT;
@@ -147,9 +162,9 @@
 
   // Волна от нажатия на кнопку кассы.
   function ripple(btn, e) {
-    if (!MOTION) return;
+    if (!MOTION || !btn) return;
     const r = btn.getBoundingClientRect(), s = Math.max(r.width, r.height) * 2.2, d = document.createElement("span");
-    d.className = "rip"; d.style.cssText = `width:${s}px;height:${s}px;left:${(e.clientX || r.left + r.width / 2) - r.left - s / 2}px;top:${(e.clientY || r.top + r.height / 2) - r.top - s / 2}px`;
+    d.className = "rip"; d.style.cssText = `width:${s}px;height:${s}px;left:${(e?.clientX || r.left + r.width / 2) - r.left - s / 2}px;top:${(e?.clientY || r.top + r.height / 2) - r.top - s / 2}px`;
     btn.appendChild(d); setTimeout(() => d.remove(), 650);
   }
 
@@ -169,7 +184,7 @@
     check();
   }
 
-  async function api(path, body) {
+  async function api(path, body, tries = 0) {
     const opt = { headers: {} };
     if (store.tok) opt.headers.Authorization = "Bearer " + store.tok;
     if (body !== undefined) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
@@ -177,31 +192,54 @@
     try { r = await fetch(API + "/api/" + path, opt); }
     catch { throw new Error("Нет связи с сервером. Проверьте интернет"); }
     const data = await r.json().catch(() => ({}));
+    // Вход и регистрация в час пик: сервер проверяет пароли по очереди и просит повторить — повторяем сами.
+    if (r.status === 503 && (path === "login" || path === "register") && tries < 4) {
+      await sleep(800 + Math.random() * 1200 * (tries + 1));
+      return api(path, body, tries + 1);
+    }
     if (r.status === 401 && store.tok && path !== "login") { store.tok = ""; state.user = null; render(); }
-    if (!r.ok) throw new Error(data.error || "Ошибка " + r.status);
+    if (!r.ok) throw new Error(data.error || (r.status === 503 ? "Сервер занят, попробуйте через минуту" : "Ошибка " + r.status));
     return data;
   }
 
-  // ---------- карточка со штампами ----------
-  function slotsHtml(points, freshFrom = null) {
+  // ---------- оттиски ----------
+  function slotsHtml(points, freshFrom = null, paper) {
     const n = SLOTS(), filled = Math.min(n, Math.floor(points / RULES.perCup));
     let s = "";
     for (let i = 0; i < n; i++) {
-      const on = i < filled, fresh = on && freshFrom !== null && i >= freshFrom;
+      const on = i < filled, isFresh = on && freshFrom !== null && i >= freshFrom;
       s += on
-        ? `<div class="slot on${fresh ? " fresh" : ""}" style="--rot:${rot(i)}">${stamp()}</div>`
+        ? `<div class="slot on${isFresh ? " fresh" : ""}" style="--rot:${rot(i)}">${stamp(paper)}</div>`
         : `<div class="slot"><span class="n">${(i + 1) * RULES.perCup}</span></div>`;
     }
     return s;
   }
-  function stampCard(points, { row = false, freshFrom = null, desk = false } = {}) {
+  const leftText = (points, desk) => {
+    if (points >= RULES.freeCost) {
+      const extra = points > RULES.freeCost ? ` Сверху ещё ${pts(points - RULES.freeCost)}.` : "";
+      return `<span class="ready">${desk ? "Можно выдать бесплатный кофе." : "Бесплатный кофе готов — закажите ниже."}${extra}</span>`;
+    }
+    return `Ещё <b>${cups(Math.ceil((RULES.freeCost - points) / RULES.perCup))}</b> — и следующий кофе бесплатно`;
+  };
+
+  // Карта-пропуск ученика: спереди баллы и оттиски, нажатие переворачивает — сзади личный QR.
+  function passHtml(u, points, { prev = points, freshFrom = null, demo = false } = {}) {
     const ready = points >= RULES.freeCost;
-    const left = Math.ceil((RULES.freeCost - points) / RULES.perCup);
-    const extra = ready && points > RULES.freeCost ? ` На карте ещё ${pts(points - RULES.freeCost)} сверху.` : "";
-    const foot = ready
-      ? `<p class="card-foot ready">${desk ? "Можно выдать бесплатный кофе." : "Бесплатный кофе готов — скажите бариста."}${extra}</p>`
-      : `<p class="card-foot">Ещё <b>${cups(left)}</b> — и следующий кофе бесплатно.</p>`;
-    return `<div class="stamps${row ? " row" : ""}">${slotsHtml(points, freshFrom)}</div>${foot}`;
+    const front = `<div class="face front">
+        <div class="p-top"><span class="p-brand">${brandMark()}<b>МУКР Кофе</b></span><span class="p-rate">+${RULES.perCup} за стакан</span></div>
+        ${ptsHtml(prev)}
+        <div class="stamps dark" ${demo ? 'id="demoSlots"' : ""}>${slotsHtml(points, freshFrom, "#1B0E7A")}</div>
+        <div class="p-foot"><span class="p-name">${esc(u.name)}</span>${demo ? "" : `<span class="p-flip">${ico("flip", 15)}QR</span>`}</div>
+      </div>`;
+    if (demo) return `<div class="pass${ready ? " ready" : ""}" id="demo">${front}<div class="badge" id="badge">${ico("gift")}Кофе бесплатно</div></div>`;
+    return `<button class="pass${ready ? " ready" : ""}" id="pass" type="button" aria-pressed="false" aria-label="Карта: ${pts(points)}. Нажмите, чтобы показать QR">
+        <div class="pass-in">${front}
+          <div class="face back">
+            <div class="p-qr">${qrSvg(u.code)}</div>
+            <div class="p-code">${fmtCode(u.code)}</div>
+            <span class="p-hint">Нажмите, чтобы вернуть карту</span>
+          </div></div>
+      </button>`;
   }
 
   // ---------- гость: главная + вход ----------
@@ -213,11 +251,10 @@
         <button class="ghost" data-go="login">Войти</button>
       </header>
       <section class="hero intro">
-        <div>
+        <div class="hero-txt">
           <div class="seal">${sealSvg()}</div>
-          <p class="kicker">Для студентов МУКР</p>
-          <h1><span class="ln"><span>Седьмой кофе —</span></span><span class="ln"><span><em>за счёт</em></span></span><span class="ln"><span><em>кофейни</em></span></span></h1>
-          <p class="lead">${RULES.perCup} баллов за каждый стакан. Накопили ${RULES.freeCost} — следующий кофе бесплатно. Карта всегда в телефоне.</p>
+          <h1><span class="ln"><span>Седьмой кофе&nbsp;—</span></span><span class="ln"><span><em>за&nbsp;счёт</em></span></span><span class="ln"><span><em>кофейни</em></span></span></h1>
+          <p class="lead">${RULES.perCup} баллов за каждый стакан. Накопили ${RULES.freeCost}&nbsp;— следующий кофе бесплатно. Карта всегда в&nbsp;телефоне.</p>
           <div class="cta-row">
             <button class="btn" data-go="register">Завести карту</button>
             <button class="btn soft" data-go="login">У меня уже есть карта</button>
@@ -228,32 +265,27 @@
             <div class="gift"><b>0 <small>сом</small></b>Седьмой</div>
           </div>
         </div>
-        <div class="stage" id="stage" aria-label="Пример карты: бариста ставит штамп за каждый стакан">
-          <div class="tilt"><div class="card" id="demo">
-            <div class="card-head"><span class="name">Пример карты</span><span>+${RULES.perCup} за стакан</span></div>
-            ${ptsHtml(0)}
-            <div class="stamps" id="demoSlots">${slotsHtml(0)}</div>
-            <div class="badge" id="badge">${ico("gift")}Кофе бесплатно</div>
-          </div></div>
+        <div class="stage" id="stage" aria-label="Пример карты: бариста ставит оттиск за каждый стакан">
+          <div class="tilt">${passHtml({ name: "Ваше имя" }, 0, { demo: true })}</div>
           <div class="tool" id="tool">${toolSvg}</div>
         </div>
       </section>
       <section class="how" aria-label="Как это работает">
         <div class="how-in">
-          <h2 class="rv">Как это работает</h2>
-          <div class="step" style="--d:0s"><div class="ic">${ico("userPlus")}</div><b>Заведите карту</b><p>Имя, группа и телефон. Сразу появится ваш личный QR-код.</p></div>
-          <div class="step" style="--d:.15s"><div class="ic">${ico("qr")}</div><b>Платите по QR или на кассе</b><p>Оплатите в приложении банка прямо с карты — или покажите свой код бариста. За каждый стакан — ${RULES.perCup} баллов.</p></div>
-          <div class="step" style="--d:.3s"><div class="ic">${ico("gift")}</div><b>${RULES.freeCost} баллов — кофе бесплатно</b><p>Маленький или большой, на выбор. Баллы списываются, карта начинается заново.</p></div>
+          <h2 class="rv">Три шага до&nbsp;бесплатного кофе</h2>
+          <div class="step" style="--d:0s"><span class="no">1</span><b>Заведите карту</b><p>Имя, группа и телефон — полминуты. Сразу появится личный QR.</p></div>
+          <div class="step" style="--d:.15s"><span class="no">2</span><b>Закажите и покажите QR</b><p>Выберите кофе в телефоне, у кассы покажите QR. Бариста сканирует — и на карте оттиск, +${RULES.perCup} баллов.</p></div>
+          <div class="step" style="--d:.3s"><span class="no">3</span><b>${SLOTS()}-й оттиск — кофе бесплатно</b><p>На ${RULES.freeCost} баллах закажите маленький или большой за баллы. Карта начнётся заново.</p></div>
         </div>
       </section>
       <section class="auth" id="auth">
         <div class="rv">
           <h2>Ваша карта</h2>
-          <p>Регистрация занимает полминуты. Дальше просто показывайте QR при оплате.</p>
+          <p>Баллы хранятся у кофейни: сменили телефон — войдите тем же номером.</p>
           <ul class="perks">
-            <li>${ico("check")}Баллы хранятся у кофейни — сменили телефон, войдите тем же номером</li>
-            <li>${ico("check")}Штамп появляется на экране сразу после оплаты</li>
-            <li>${ico("check")}В истории видно каждый стакан</li>
+            <li>${ico("check")}Оттиск появляется на экране, как только бариста отсканирует QR</li>
+            <li>${ico("check")}Платите как привыкли — наличными или картой на кассе</li>
+            <li>${ico("check")}В истории виден каждый стакан</li>
           </ul>
         </div>
         <div class="card rv" style="--d:.1s" id="authCard">${authForm("register")}</div>
@@ -265,7 +297,7 @@
     tilt();
   }
 
-  // Сцена на главной: штамп сам пробивает 6 ячеек, на шестой — «Кофе бесплатно», и заново.
+  // Сцена на главной: штамп сам ставит оттиски на карту, на последнем — «Кофе бесплатно», и заново.
   async function demoLoop(id) {
     const stage = document.getElementById("stage"), tool = document.getElementById("tool");
     const card = document.getElementById("demo"), grid = document.getElementById("demoSlots"), badge = document.getElementById("badge");
@@ -273,8 +305,8 @@
     let visible = true;
     if ("IntersectionObserver" in window) new IntersectionObserver(e => (visible = e[0].isIntersecting)).observe(stage);
     const alive = () => id === viewId && document.body.contains(stage);
-    const n = SLOTS();
-    if (!MOTION) { grid.innerHTML = slotsHtml(40); countTo(card.querySelector(".pts"), 0, 40); return; }
+    const n = SLOTS(), paper = "#1B0E7A";
+    if (!MOTION) { grid.innerHTML = slotsHtml(40, null, paper); countTo(card.querySelector(".pts"), 0, 40); return; }
     await sleep(1400);
     let pos = null;
     const place = (x, y, o = 1, ms = 520, ease = "cubic-bezier(.2,.8,.2,1)") => {
@@ -290,10 +322,9 @@
         const s = grid.children[i].getBoundingClientRect(), st = stage.getBoundingClientRect();
         const x = s.left - st.left + s.width / 2 - 38, y = s.top - st.top + s.height / 2 - 104;
         await place(x, y - 34);                                        // навели
-        await place(x, y, 1, 140, "cubic-bezier(.6,0,.9,.4)");         // удар
+        await place(x, y, 1, 140, "cubic-bezier(.6,0,.9,.4)");         // прижали
         if (!alive()) return;
-        const slot = grid.children[i];
-        slot.outerHTML = `<div class="slot on fresh" style="--rot:${rot(i)}">${stamp()}</div>`;
+        grid.children[i].outerHTML = `<div class="slot on fresh" style="--rot:${rot(i)}">${stamp(paper)}</div>`;
         card.classList.remove("hit"); void card.offsetWidth; card.classList.add("hit");
         countTo(card.querySelector(".pts"), i * RULES.perCup, (i + 1) * RULES.perCup, 420);
         await place(x, y - 44, 1, 260);                                // подняли
@@ -308,13 +339,13 @@
       if (!alive()) return;
       badge.classList.remove("show"); card.classList.remove("ready");
       await grid.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 350, fill: "forwards" }).finished;
-      grid.innerHTML = slotsHtml(0); grid.getAnimations().forEach(a => a.cancel());
+      grid.innerHTML = slotsHtml(0, null, paper); grid.getAnimations().forEach(a => a.cancel());
       countTo(card.querySelector(".pts"), RULES.freeCost, 0, 500);
       await sleep(900);
     }
   }
 
-  // Карточка на главной поворачивается за курсором.
+  // Карта на главной поворачивается за курсором.
   function tilt() {
     const stage = document.getElementById("stage");
     if (!stage || !MOTION || !matchMedia("(pointer: fine)").matches) return;
@@ -339,16 +370,18 @@
     const reg = mode === "register";
     return `<form class="form${anim ? " swap" : ""}" data-mode="${mode}" novalidate>
         ${reg ? `<div class="two">
-          <div class="field"><label for="f-name">Имя и фамилия</label><input id="f-name" name="name" autocomplete="name" required></div>
-          <div class="field"><label for="f-group">Группа</label><input id="f-group" name="group" placeholder="ПИ-2" required></div>
-        </div>` : ""}
+          <div class="field"><label for="f-name">Имя и фамилия</label><input id="f-name" name="name" autocomplete="name" maxlength="60" required></div>
+          <div class="field"><label for="f-group">Группа</label><input id="f-group" name="group" placeholder="ПИ-2" maxlength="20" required></div>
+        </div>
+        <div class="trap" aria-hidden="true"><label>Сайт <input name="website" tabindex="-1" autocomplete="off"></label></div>` : ""}
         <div class="field"><label for="f-phone">Телефон</label>
-          <input id="f-phone" name="phone" type="${reg ? "tel" : "text"}" inputmode="${reg ? "tel" : "text"}" autocomplete="username" placeholder="0700 123 456" required>
+          <input id="f-phone" name="phone" type="tel" inputmode="tel" autocomplete="${reg ? "tel" : "username"}" placeholder="0700 123 456" maxlength="20" required>
           ${reg ? "" : '<div class="hint">Вы бариста или администрация? <a href="#staff">Вход для сотрудников</a></div>'}</div>
         <div class="field"><label for="f-pass">Пароль</label>
-          <input id="f-pass" name="password" type="password" autocomplete="${reg ? "new-password" : "current-password"}" minlength="6" required>
-          ${reg ? '<div class="hint">Не короче 6 символов.</div>' : ""}</div>
-        <p class="err" id="f-err"></p>
+          <div class="pw"><input id="f-pass" name="password" type="password" autocomplete="${reg ? "new-password" : "current-password"}" minlength="6" maxlength="128" required>
+          <button type="button" class="pw-eye" aria-label="Показать пароль" aria-pressed="false">Показать</button></div>
+          <div class="hint">${reg ? "Не короче 6 символов." : "Забыли пароль? Подойдите к бариста — администрация выдаст новый."}</div></div>
+        <p class="err" id="f-err" role="alert"></p>
         <button class="btn wide" type="submit">${reg ? "Завести карту" : "Войти"}</button>
       </form>`;
   }
@@ -373,8 +406,17 @@
     bindForm();
   }
 
+  function bindEye(f) {
+    const eye = f.querySelector(".pw-eye");
+    if (eye) eye.onclick = () => {
+      const i = f.querySelector(".pw input"), show = i.type === "password";
+      i.type = show ? "text" : "password"; eye.textContent = show ? "Скрыть" : "Показать"; eye.setAttribute("aria-pressed", show);
+    };
+  }
+
   function bindForm() {
     const f = document.querySelector("#formHost form");
+    bindEye(f);
     f.onsubmit = async e => {
       e.preventDefault();
       const btn = f.querySelector("button[type=submit]"), err = f.querySelector(".err");
@@ -383,7 +425,7 @@
       try {
         const r = await api(f.dataset.mode, body);
         store.tok = r.token; state.user = r.user;
-        toast(f.dataset.mode === "register" ? "Карта готова" : "С возвращением, " + r.user.name.split(" ")[0]);
+        toast(f.dataset.mode === "register" ? "Карта готова — нажмите на неё, чтобы увидеть QR" : "С возвращением, " + r.user.name.split(" ")[0]);
         window.scrollTo(0, 0); render();
       } catch (x) {
         err.textContent = x.message; btn.disabled = false;
@@ -405,7 +447,13 @@
     </header>`;
   }
 
-  function viewStudent(first) {
+  // Заказ, который ещё ждёт бариста: не оплачен на кассе или оплачен, но не выдан.
+  const waitingOrder = me => {
+    const o = me?.order;
+    return o && (o.status === "paid" || (o.status === "pending" && DESK(o.provider))) ? o : null;
+  };
+
+  function viewStudent(firstDraw) {
     const u = state.user, me = state.me;
     const points = me ? me.user.points : u.points;
     const prev = state.lastPts;
@@ -415,89 +463,129 @@
     const hist = me ? me.history : [];
     const seen = state.lastOp;
     state.lastOp = hist.length ? hist[0].id : seen;
-    const ready = points >= RULES.freeCost;
+    const wo = waitingOrder(me);
     $app.innerHTML = `
-      ${headerUser("Бонусная карта")}
-      <div class="shell${first ? "" : " calm"}">
-        <div class="hello"><h1>Привет, ${esc(u.name.split(" ")[0])}</h1><p>${esc(u.group)}</p></div>
-        ${orderBlock(points)}
-        <section class="ticket" aria-label="Ваш QR-код">
-          <button class="iconbtn grow" id="grow" aria-label="Открыть QR во весь экран">${ico("max")}</button>
-          <button class="qr" id="qr" aria-label="Открыть QR во весь экран">${qrSvg(u.code)}</button>
-          <div class="code">${fmtCode(u.code)}</div>
-          <p class="cap">Покажите код на кассе. Если камера не считает — назовите бариста буквы под ним.</p>
+      ${headerUser(esc(u.group) || "Бонусная карта")}
+      <div class="shell${firstDraw ? "" : " calm"}">
+        <div class="hello"><h1>Привет, ${first(u.name)}</h1></div>
+        <section class="pass-wrap" aria-label="Ваша карта">
+          ${passHtml(u, points, { prev: prev ?? points, freshFrom })}
+          <p class="pass-cap" id="passCap">${leftText(points)}</p>
         </section>
-        <section class="card${ready ? " ready" : ""}" id="myCard" aria-label="Баллы">
-          <div class="card-head"><span>Ваши баллы</span><span>+${RULES.perCup} за каждый стакан</span></div>
-          ${ptsHtml(prev ?? points)}
-          ${stampCard(points, { row: true, freshFrom })}
-        </section>
+        ${wo ? `<button class="waiting" id="wo" type="button">
+            <span class="w-ic">${ico("qr", 24)}</span>
+            <span><b>${wo.num ? `Заказ №${wo.num}` : size(wo.size) + " кофе"} ждёт у кассы</b>
+            <small>${wo.free ? "За баллы" : DESK(wo.provider) && wo.status === "pending" ? `${wo.amount} сом — оплата на кассе` : "Оплачено"}. Покажите QR бариста.</small></span>
+          </button>` : orderBlock(points)}
         ${me ? `<div class="facts">
           <div class="fact"><b>${me.cups}</b><span>${plural(me.cups, "стакан", "стакана", "стаканов")} по карте</span></div>
           <div class="fact"><b>${me.free}</b><span>${plural(me.free, "бесплатный кофе", "бесплатных кофе", "бесплатных кофе")}</span></div>
         </div>` : ""}
         <section class="hist">
           <h2>История</h2>
-          ${hist.length ? `<ul class="list">${(state.histAll ? hist : hist.slice(0, 8)).map(o => `<li class="${seen && o.id > seen ? "new" : ""}">
+          ${hist.length ? `<ul class="list">${(state.histAll ? hist : hist.slice(0, 6)).map(o => `<li class="${seen && o.id > seen ? "new" : ""}">
             <span class="dot${o.kind === "redeem" ? " free" : ""}">${ico(o.kind === "redeem" ? "gift" : "coffee", 18)}</span>
             <span class="what"><b>${o.kind === "redeem" ? "Бесплатный кофе" : "Кофе"} · ${size(o.size).toLowerCase()}</b><span>${fmtTime(o.ts)}</span></span>
-            <span class="d ${o.delta > 0 ? "plus" : "minus"}">${o.delta > 0 ? "+" : "−"}${Math.abs(o.delta)}</span></li>`).join("")}${!state.histAll && hist.length > 8 ? `<li style="padding:0"><button class="more" id="more">Показать всё</button></li>` : ""}</ul>`
-          : `<div class="empty">Здесь появится каждый стакан. Первый штамп — на кассе.</div>`}
+            <span class="d ${o.delta > 0 ? "plus" : "minus"}">${o.delta > 0 ? "+" : "−"}${Math.abs(o.delta)}</span></li>`).join("")}${!state.histAll && hist.length > 6 ? `<li class="more-row"><button class="more" id="more">Показать всю историю</button></li>` : ""}</ul>`
+          : `<div class="empty">Здесь появится каждый стакан. Первый оттиск — на кассе.</div>`}
         </section>
-      </div>`;
+      </div>
+      <div class="dock"><button class="btn wide" id="showQr">${ico("qr")}Показать QR бариста</button></div>`;
     document.getElementById("logout").onclick = logout;
-    document.getElementById("qr").onclick = document.getElementById("grow").onclick = () => fullQr(u.code);
+    const pass = document.getElementById("pass");
+    pass.onclick = () => { const on = pass.classList.toggle("flipped"); pass.setAttribute("aria-pressed", on); };
+    document.getElementById("showQr").onclick = () => fullQr(u.code);
     const more = document.getElementById("more");
     if (more) more.onclick = () => { state.histAll = true; viewStudent(false); };
-    $app.querySelectorAll("[data-size]").forEach(b => b.onclick = () => orderCoffee(b.dataset.size, !!b.dataset.free, b));
-    const pk = $app.querySelector("[data-pickup]");
-    if (pk) pk.onclick = () => paySheet(me.order, { onPaid: () => refreshMe() });
-    // Вернулись из приложения банка (страница могла перезагрузиться) — снова показываем ожидающий заказ.
-    const o = me?.order;
-    if (o && (o.status === "pending" || o.status === "paid") && !sheet) paySheet(o, { onPaid: () => refreshMe() });
-    const card = document.getElementById("myCard");
-    countTo(card.querySelector(".pts"), prev, points);
-    if (freshFrom !== null) { navigator.vibrate?.(40); toast(`+${pts(points - prev)}. Спасибо за кофе!`); }
-    if (becameReady) setTimeout(() => { beans(card); toast("60 баллов — следующий кофе бесплатно!"); }, 500);
+    bindOrder();
+    const w = document.getElementById("wo");
+    if (w) w.onclick = () => orderSheet(me.order);
+    // Вернулись в приложение — снова показываем заказ, который ждёт бариста.
+    if (wo && !sheet && firstDraw) orderSheet(me.order);
+    countTo(pass.querySelector(".pts"), prev, points);
+    if (freshFrom !== null) {
+      navigator.vibrate?.([30, 50, 30]);
+      toast(`+${pts(points - prev)} — спасибо за кофе!`);
+      pass.classList.add("stamped"); setTimeout(() => pass.classList.remove("stamped"), 900);
+    }
+    if (becameReady) setTimeout(() => { beans(pass); toast(`${RULES.freeCost} баллов — следующий кофе бесплатно!`); }, 600);
+  }
+
+  // Выбор кофе: размер плиткой, одна кнопка «Заказать»; бесплатный — отдельным блоком, когда накопилось.
+  function orderBlock(points) {
+    const p = RULES.prices, ready = points >= RULES.freeCost, sz = ls.get("mc.size") || "s";
+    if (RULES.pay === "off" && !ready) return "";
+    const how = RULES.pay === "gopay" ? "Оплата в приложении банка, потом покажите QR на кассе."
+      : "Оплатите на кассе наличными или картой. Баллы придут, когда бариста отсканирует QR.";
+    return `<section class="card order" aria-label="Заказать кофе">
+      ${ready ? `<div class="gift-row">
+          <div class="g-head">${ico("gift")}<b>Бесплатный кофе готов</b></div>
+          <div class="sizes gift">
+            <button class="size" data-free="s"><b>Маленький</b><span>за ${RULES.freeCost} баллов</span></button>
+            <button class="size" data-free="l"><b>Большой</b><span>за ${RULES.freeCost} баллов</span></button>
+          </div></div>` : ""}
+      ${RULES.pay !== "off" ? `<div class="card-head"><span>Заказать кофе</span>${RULES.pay === "demo" ? `<span class="tag">Демо</span>` : ""}</div>
+        <div class="sizes pick" role="radiogroup" aria-label="Размер">
+          <button class="size" role="radio" aria-checked="${sz === "s"}" data-size="s"><b>Маленький</b><span>${p.s} сом</span></button>
+          <button class="size" role="radio" aria-checked="${sz === "l"}" data-size="l"><b>Большой</b><span>${p.l} сом</span></button>
+        </div>
+        <button class="btn wide go" id="orderGo">Заказать за ${p[sz]} сом</button>
+        <p class="sub pay-how">${how}</p>` : ""}
+    </section>`;
+  }
+  function bindOrder() {
+    $app.querySelectorAll("[data-size]").forEach(b => b.onclick = () => {
+      ls.set("mc.size", b.dataset.size);
+      $app.querySelectorAll("[data-size]").forEach(x => x.setAttribute("aria-checked", x === b));
+      document.getElementById("orderGo").textContent = `Заказать за ${RULES.prices[b.dataset.size]} сом`;
+    });
+    const go = document.getElementById("orderGo");
+    if (go) go.onclick = () => orderCoffee(ls.get("mc.size") || "s", false, go);
+    $app.querySelectorAll("[data-free]").forEach(b => b.onclick = () => orderCoffee(b.dataset.free, true, b));
   }
 
   function fullQr(code) {
     const d = document.createElement("div");
     d.className = "full"; d.setAttribute("role", "dialog"); d.setAttribute("aria-label", "QR-код");
     d.innerHTML = `<button class="iconbtn" aria-label="Закрыть">${ico("x", 26)}</button>
-      <div class="box">${qrSvg(code, "q")}<div class="code">${fmtCode(code)}</div></div>`;
+      <div class="box">${qrSvg(code, "q")}<div class="code">${fmtCode(code)}</div>
+      <p class="bright">${ico("sun", 16)}Прибавьте яркость — камера считает быстрее</p></div>`;
     const close = () => { d.remove(); document.removeEventListener("keydown", onKey); };
     const onKey = e => e.key === "Escape" && close();
     d.onclick = close; document.addEventListener("keydown", onKey);
     document.body.appendChild(d); d.querySelector("button").focus();
   }
 
-  // ---------- оплата по QR: шторка заказа ----------
+  // ---------- заказ ученика: шторка с QR и ходом заказа ----------
   const BANKS = { mbank: "MBank", megapay: "MegaPay", optima: "Optima24", odengi: "О!Деньги", bakai: "Bakai24",
     elcart: "Элкарт", keremet: "Keremet", demir: "Demir", rsk: "РСК", kicb: "KICB", aiyl: "Айыл Банк", balance: "Balance" };
   const bankName = k => BANKS[k.toLowerCase()] || k.charAt(0).toUpperCase() + k.slice(1);
   const qrOf = data => { const q = qrcode(0, "M"); q.addData(data); q.make(); return q.createSvgTag({ cellSize: 4, margin: 0, scalable: true }); };
   let sheet = null; // открытая шторка: { el, order, timer, opts }
 
-  function paySheet(order, opts = {}) {
+  function openSheet(label) {
     closeSheet();
     const el = document.createElement("div");
-    el.className = "sheet-wrap"; el.setAttribute("role", "dialog"); el.setAttribute("aria-modal", "true"); el.setAttribute("aria-label", "Оплата заказа");
+    el.className = "sheet-wrap"; el.setAttribute("role", "dialog"); el.setAttribute("aria-modal", "true"); el.setAttribute("aria-label", label);
     el.innerHTML = `<div class="sheet"></div>`;
     document.body.appendChild(el);
-    el.addEventListener("click", e => { if (e.target === el && order.status !== "pending") closeSheet(); });
-    sheet = { el, order, opts, timer: 0, tick: 0 };
+    return el;
+  }
+  function orderSheet(order, opts = {}) {
+    const el = openSheet("Заказ");
+    el.addEventListener("click", e => { if (e.target === el) closeSheet(); });
+    sheet = { el, order, opts, timer: 0, tick: 0, onClose: () => refreshMe(true) };
     drawSheet();
     if (live(order)) pollOrder();
   }
-  // Ученик ждёт, пока бариста отсканирует QR: опрашиваем и pending, и оплаченный, но не выданный заказ.
-  const live = o => o.status === "pending" || (o.status === "paid" && !sheet?.opts.desk);
+  // Ученик ждёт бариста: опрашиваем и неоплаченный, и оплаченный, но не выданный заказ.
+  const live = o => o.status === "pending" || o.status === "paid";
   function closeSheet() {
     if (!sheet) return;
     clearTimeout(sheet.timer); clearInterval(sheet.tick);
-    const el = sheet.el; sheet = null;
+    const el = sheet.el, after = sheet.onClose; sheet = null;
     el.classList.add("out"); setTimeout(() => el.remove(), MOTION ? 280 : 0);
-    if (state.user?.role === "student") { try { localStorage.removeItem("mc.order"); } catch {} }
+    after?.();
   }
   async function pollOrder() {
     if (!sheet || !live(sheet.order)) return;
@@ -509,68 +597,63 @@
       s.order = Object.assign(s.order, r.order);
       if (r.order.status !== was) {
         drawSheet();
-        if (r.order.status === "paid" || r.order.status === "served") { navigator.vibrate?.([30, 60, 30]); s.opts.onPaid?.(r); }
+        if (r.order.status === "served") {
+          // Бариста отсканировал и выдал: шторка уходит, оттиск ставится на карту у ученика на глазах.
+          navigator.vibrate?.([30, 60, 30]);
+          s.onClose = () => refreshMe();
+          s.timer = setTimeout(() => sheet === s && closeSheet(), 1500);
+          return;
+        }
         if (!live(s.order)) return;
       }
     } catch {}
-    if (sheet === s) s.timer = setTimeout(pollOrder, document.visibilityState === "visible" ? 2000 : 5000);
+    if (sheet === s) s.timer = setTimeout(pollOrder, document.visibilityState === "visible" ? 2000 : 6000);
   }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && sheet && live(sheet.order)) { clearTimeout(sheet.timer); pollOrder(); }
+    if (document.visibilityState === "visible" && sheet && !sheet.guest && live(sheet.order)) { clearTimeout(sheet.timer); pollOrder(); }
   });
 
+  // Ход заказа: три шага, текущий подсвечен.
+  const stepsHtml = (at, free) => `<ol class="track" aria-label="Ход заказа">
+      ${["Заказ принят", "Бариста сканирует QR", free ? "Кофе ваш" : `+${RULES.perCup} баллов`].map((t, i) =>
+        `<li class="${i < at ? "done" : i === at ? "now" : ""}"><i>${i < at ? ico("check", 14) : ""}</i>${t}</li>`).join("")}
+    </ol>`;
+
   function drawSheet() {
-    const { el, order: o, opts } = sheet, box = el.querySelector(".sheet");
+    const { order: o } = sheet, box = sheet.el.querySelector(".sheet");
     clearInterval(sheet.tick);
-    const what = `${o.free ? "Бесплатный" : size(o.size)}${o.free ? " " + size(o.size).toLowerCase() : ""} кофе`;
+    const what = `${o.free ? "Бесплатный " + size(o.size).toLowerCase() : size(o.size)} кофе`;
     const close = `<button class="iconbtn sheet-x" data-close aria-label="Закрыть">${ico("x")}</button>`;
-    const demo = o.provider === "demo";
-    const bonus = o.free ? "" : ` и +${RULES.perCup} баллов`;
-    // QR заказа, который показывают бариста: в демо — сразу, с банком — после оплаты.
-    const pickup = `<div class="payqr big">${qrOf(o.pickup)}</div>
-        <p class="cap"><b>Покажите этот QR бариста.</b> Заказ подтвердится${bonus} — как только он отсканирует.</p>`;
-    if (o.status === "pending" && demo && !opts.desk) {
-      box.innerHTML = `<div class="grip" aria-hidden="true"></div>
-        <div class="sh-head"><div><b>${what}</b><span>${o.amount} сом · оплата у бариста</span></div></div>
-        <div class="wait"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Ждём, пока бариста отсканирует</span><span class="left" id="left"></span></div>
-        ${pickup}
-        <button class="linkbtn" data-cancel>Отменить заказ</button>`;
-    } else if (o.status === "pending" && demo) {
-      box.innerHTML = `<div class="grip" aria-hidden="true"></div>
-        <div class="sh-head"><div><b>${what}</b><span>${o.amount} сом · ${esc(state.guest?.name || "")}</span></div></div>
-        <p class="cap">Примите оплату и выдайте кофе — баллы начислятся при выдаче.</p>
-        <button class="btn wide" data-hand>${ico("check")}Оплата получена — выдать${bonus ? " · +" + RULES.perCup : ""}</button>
+    const myQr = `<div class="payqr big">${qrSvg(state.user.code)}</div><div class="p-code center">${fmtCode(state.user.code)}</div>`;
+    if (o.status === "pending" && DESK(o.provider)) {
+      box.innerHTML = `${close}<div class="sh-head"><b>${what}</b><span>${o.amount} сом · оплата на кассе</span></div>
+        ${stepsHtml(1)}
+        ${myQr}
+        <p class="cap"><b>Покажите QR бариста</b> и оплатите наличными или картой. Заказ ждёт ещё <span id="left"></span>.</p>
         <button class="linkbtn" data-cancel>Отменить заказ</button>`;
     } else if (o.status === "pending") {
       const links = Object.entries(o.appLinks || {}).filter(([, u]) => u);
-      box.innerHTML = `<div class="grip" aria-hidden="true"></div>
-        <div class="sh-head"><div><b>${what}</b><span>${o.amount} сом${opts.desk ? " · " + esc(state.guest?.name || "") : ""}</span></div></div>
+      box.innerHTML = `${close}<div class="sh-head"><b>${what}</b><span>${o.amount} сом</span></div>
         <div class="wait"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Ждём оплату</span><span class="left" id="left"></span></div>
-        ${!opts.desk && links.length ? `<p class="sh-label">Оплатите в приложении своего банка</p>
+        ${links.length ? `<p class="sh-label">Оплатите в приложении своего банка</p>
           <div class="banks">${links.map(([k, u]) => `<a class="bank" href="${esc(u)}">${ico("out", 18)}${esc(bankName(k))}</a>`).join("")}</div>` : ""}
-        ${!opts.desk && o.checkoutUrl ? `<a class="btn soft wide" href="${esc(o.checkoutUrl)}" target="_blank" rel="noopener">Все банки и Элкарт</a>` : ""}
-        ${o.qrData ? `<div class="payqr${opts.desk ? " big" : ""}">${qrOf(o.qrData)}</div>
-          <p class="cap">${opts.desk ? "Попросите ученика отсканировать код в приложении банка. Баллы начислятся при выдаче." :
-            links.length || o.checkoutUrl ? "Платите с другого телефона? Отсканируйте этот код." : "Отсканируйте код в приложении банка."}</p>` : ""}
+        ${o.checkoutUrl ? `<a class="btn soft wide" href="${esc(o.checkoutUrl)}" target="_blank" rel="noopener">Все банки и Элкарт</a>` : ""}
+        ${o.qrData ? `<div class="payqr">${qrOf(o.qrData)}</div><p class="cap">Платите с другого телефона? Отсканируйте этот код в приложении банка.</p>` : ""}
         <button class="linkbtn" data-cancel>Отменить заказ</button>`;
-    } else if (o.status === "paid" && !opts.desk) {
-      box.innerHTML = `${close}<div class="sh-head"><div><b>${what}</b><span>${o.free ? "за баллы" : "оплачено"} · заказ №${o.num}</span></div></div>
-        <div class="wait"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Ждём, пока бариста отсканирует</span></div>
-        ${pickup}`;
     } else if (o.status === "paid") {
-      box.innerHTML = `${close}<div class="done"><b>Оплачено</b><div class="num"><span>Заказ</span>№${o.num}</div>
-          <p>Выдайте кофе кнопкой «Выдать» в карточке ученика — тогда начислятся баллы.</p></div>
-        <button class="btn wide" data-close>Готово</button>`;
+      box.innerHTML = `${close}<div class="sh-head"><b>${what}</b><span>${o.free ? "за баллы" : "оплачено"}${o.num ? " · заказ №" + o.num : ""}</span></div>
+        ${stepsHtml(1, o.free)}
+        ${myQr}
+        <p class="cap"><b>Покажите QR бариста</b> — он отсканирует и отдаст кофе.</p>`;
     } else if (o.status === "served") {
-      box.innerHTML = `${close}<div class="done">
-          <svg class="tick" viewBox="0 0 64 64" aria-hidden="true"><circle cx="32" cy="32" r="29" pathLength="1"/><path d="M19 33l9 9 17-19" pathLength="1"/></svg>
-          <b>Отсканировано</b>
-          <div class="num"><span>Заказ</span>№${o.num}</div>
-          <p>${o.free ? "Бесплатный кофе выдан. Приятного!" : `+${RULES.perCup} баллов на карте. Приятного кофе!`}</p>
+      box.innerHTML = `<div class="done">
+          <div class="big-stamp">${stamp()}</div>
+          <b>${o.free ? "Приятного кофе!" : `+${RULES.perCup} баллов`}</b>
+          <p>${o.free ? "Бесплатный кофе выдан, карта начинается заново." : "Оттиск уже на карте. Приятного кофе!"}</p>
           ${o.test ? `<span class="demo">Демо</span>` : ""}
-        </div><button class="btn wide" data-close>Готово</button>`;
+        </div>`;
     } else {
-      const why = { expired: "Время на оплату вышло", cancelled: "Заказ отменён", failed: "Банк не провёл оплату" }[o.status] || "Оплата не прошла";
+      const why = { expired: "Время заказа вышло", cancelled: "Заказ отменён", failed: "Банк не провёл оплату" }[o.status] || "Оплата не прошла";
       box.innerHTML = `${close}<div class="done fail"><b>${why}</b><p>Деньги не списаны. Можно оформить заказ ещё раз.</p></div>
         <button class="btn wide" data-close>Понятно</button>`;
     }
@@ -580,67 +663,39 @@
       const upd = () => { const s = Math.max(0, o.expires - Date.now() / 1000); left.textContent = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`; };
       upd(); sheet.tick = setInterval(upd, 1000);
     }
-    const hand = box.querySelector("[data-hand]");
-    if (hand) hand.onclick = async () => {
-      hand.disabled = true;
-      try { const r = await scanned(o.pickup); sheet.order = Object.assign(sheet.order, r.order); drawSheet(); }
-      catch { hand.disabled = false; }
-    };
     const c = box.querySelector("[data-cancel]");
     if (c) c.onclick = async () => {
       c.disabled = true;
-      try { const r = await api(`orders/${o.id}/cancel`, {}); sheet.order.status = r.order.status; drawSheet(); }
+      try { const r = await api(`orders/${o.id}/cancel`, {}); sheet.order.status = r.order.status; sheet.onClose = () => refreshMe(true); drawSheet(); }
       catch (x) { toast(x.message, true); c.disabled = false; }
     };
-    box.querySelector(".bank, .btn, [data-close]")?.focus({ preventScroll: true });
   }
-  document.addEventListener("keydown", e => { if (e.key === "Escape" && sheet && sheet.order.status !== "pending") closeSheet(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && sheet) closeSheet(); });
 
-  // Ученик оформляет заказ: обычный (QR) или бесплатный за баллы.
+  // Ученик оформляет заказ: обычный (оплата на кассе или в банке) или бесплатный за баллы.
   async function orderCoffee(sz, free, btn) {
     btn && (btn.disabled = true);
     try {
       const r = await api("orders", { size: sz, free });
-      try { localStorage.setItem("mc.order", r.order.id); } catch {}
-      paySheet(r.order, { onPaid: () => refreshMe() });
-      if (free) refreshMe();
+      orderSheet(r.order);
+      sheet.onClose = () => refreshMe(true);
+      refreshMe(true);
     } catch (x) { toast(x.message, true); }
     btn && (btn.disabled = false);
   }
 
-  function orderBlock(points) {
-    const p = RULES.prices, ready = points >= RULES.freeCost, o = state.me?.order;
-    const waits = o && (o.status === "paid" || (o.status === "pending" && o.provider === "demo"));
-    const banner = waits ? `<button class="ready-banner" data-pickup>${ico("qr")}<div><b>${o.num ? `Заказ №${o.num}` : "Заказ"} ждёт бариста</b>
-      <span>${size(o.size)}${o.free ? " · бесплатный" : ""}. Нажмите и покажите QR заказа${o.free ? "" : ` — после сканирования придут +${RULES.perCup} баллов`}.</span></div></button>` : "";
-    if (RULES.pay === "off" && !ready) return banner;
-    return `${banner}<section class="card order" aria-label="Заказать кофе">
-      <div class="card-head"><span>Заказать и оплатить</span>${RULES.pay === "demo" ? `<span class="tag">Демо</span>` : `<span class="tag">${ico("qr", 14)}QR</span>`}</div>
-      ${RULES.pay !== "off" ? `<p class="sub">${RULES.pay === "demo" ? "Выберите кофе и покажите QR заказа бариста" : "Оплата в приложении банка, потом покажите QR заказа бариста"} — после сканирования придут баллы.</p>
-      <div class="sizes">
-        <button class="size" data-size="s"><b>Маленький</b><span>${p.s} сом</span></button>
-        <button class="size" data-size="l"><b>Большой</b><span>${p.l} сом</span></button>
-      </div>` : ""}
-      ${ready ? `<div class="sizes gift">
-        <button class="size" data-size="s" data-free="1"><b>Маленький</b><span>бесплатно</span></button>
-        <button class="size" data-size="l" data-free="1"><b>Большой</b><span>бесплатно</span></button>
-      </div>` : ""}
-    </section>`;
-  }
-
-  async function refreshMe() {
+  async function refreshMe(force) {
     try {
       const me = await api("me");
-      const changed = !state.me || me.user.points !== state.me.user.points || me.history.length !== state.me.history.length
-        || (me.history[0] && me.history[0].id) !== (state.me.history[0] && state.me.history[0].id)
-        || JSON.stringify(me.order && [me.order.id, me.order.status]) !== JSON.stringify(state.me.order && [state.me.order.id, state.me.order.status]);
+      const key = m => JSON.stringify([m.user.points, m.history[0]?.id, m.order && [m.order.id, m.order.status]]);
+      const changed = force || !state.me || key(me) !== key(state.me);
       state.me = me; state.user = me.user;
-      if (changed && state.user.role === "student") viewStudent(false);
+      if (changed && state.user.role === "student" && !sheet) viewStudent(false);
     } catch {}
   }
 
-  // ---------- бариста ----------
-  let cam = { stream: null, raf: 0 };
+  // ---------- касса ----------
+  let cam = { stream: null, raf: 0, busy: false };
 
   function viewDesk() {
     $app.innerHTML = headerUser("Касса · " + esc(state.user.name)) + deskHtml();
@@ -648,42 +703,46 @@
     bindDesk();
   }
 
-  // Касса: очередь оплаченных заказов сверху, сканер и карта ученика, итоги дня. Встраивается и в кабинет администрации.
+  // Касса: итоги дня полосой, сканер и очередь рядом, операции дня ниже. Встраивается и в кабинет администрации.
   function deskHtml() {
     return `
       <div class="desk">
-        <section class="queue" id="queue" aria-live="polite" aria-label="Заказы к выдаче"></section>
-        <div class="col">
+        <section class="today" id="today" aria-label="Сегодня"></section>
+        <div class="desk-main">
           <section class="scan" aria-label="Сканер">
             <div class="viewport" id="vp">
-              <div class="idle">${ico("camera", 32)}<span>Наведите камеру на QR ученика</span>
+              <div class="idle">${ico("camera", 32)}<b>Сканер QR</b><span>Наведите камеру на QR в телефоне ученика</span>
                 <button class="btn foam" id="camOn">Включить камеру</button></div>
             </div>
             <form class="manual" id="manual">
               <label class="sr" for="m-code">Код карты</label>
-              <input id="m-code" placeholder="Код: XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="9">
-              <button class="btn foam" type="submit">Найти</button>
+              <input id="m-code" placeholder="Код карты: XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="40">
+              <button class="btn foam" type="submit">${ico("search", 18)}<span class="sr">Найти</span></button>
             </form>
           </section>
-          <section id="guest"></section>
+          <section class="queue" id="queue" aria-live="polite" aria-label="Заказы, которые ждут"></section>
         </div>
-        <section class="panel" id="today"></section>
+        <details class="ops" id="ops"><summary>Операции за сегодня ${ico("down", 18)}</summary><div id="opsList"></div></details>
       </div>`;
   }
   function bindDesk() {
     document.getElementById("camOn").onclick = startCam;
+    const m = document.getElementById("m-code");
+    // Ручной ввод и USB-сканер (он «печатает» содержимое QR и Enter) — оба сюда.
     document.getElementById("manual").onsubmit = e => {
       e.preventDefault();
-      const v = document.getElementById("m-code").value.replace(/[^a-z0-9]/gi, "");
-      if (v.length < 8) return toast("В коде 8 знаков", true);
-      lookup(v);
+      const raw = m.value.trim();
+      const v = raw.startsWith(QR_PREFIX) || raw.startsWith(PICKUP) ? raw : raw.replace(/[^a-z0-9]/gi, "");
+      if (!raw.startsWith(PICKUP) && v.replace(QR_PREFIX, "").length < 8) return toast("В коде карты 8 знаков", true);
+      m.value = ""; onScan(v.startsWith(QR_PREFIX) || v.startsWith(PICKUP) ? v : QR_PREFIX + v);
     };
-    renderGuest(); loadToday(); loadQueue();
+    if (ls.get("mc.cam") === "1") startCam();
+    loadToday(); loadQueue();
   }
 
-  // ---------- очередь заказов на кассе ----------
+  // ---------- очередь заказов ----------
   let queueSeen = null, audio = null;
-  // Мягкий двухнотный сигнал о новом оплаченном заказе (звук включается после первого нажатия на странице).
+  // Мягкий двухнотный сигнал о новом заказе (звук включается после первого нажатия на странице).
   function chime() {
     try {
       audio = audio || new (window.AudioContext || window.webkitAudioContext)();
@@ -698,27 +757,27 @@
   }
   document.addEventListener("pointerdown", () => audio?.state === "suspended" && audio.resume(), { passive: true });
 
+  const orderLine = o => o.free ? "за баллы" : o.status === "pending" ? `${o.amount} сом · оплата на кассе` : `${o.amount} сом · оплачено`;
+
   async function loadQueue() {
     const el = document.getElementById("queue");
     if (!el) return;
     let q;
     try { q = await api("queue"); } catch { return; }
     const ids = q.waiting.map(o => o.id);
-    const fresh = queueSeen ? ids.filter(i => !queueSeen.includes(i)) : [];
+    const isNew = queueSeen ? ids.filter(i => !queueSeen.includes(i)) : [];
     queueSeen = ids;
-    if (fresh.length) { chime(); navigator.vibrate?.([60, 40, 60]); }
-    const ago = ts => { const m = Math.max(0, Math.floor((Date.now() / 1000 - ts) / 60)); return m < 1 ? "только что" : m + " мин назад"; };
-    el.innerHTML = `<div class="q-head"><h2>Заказы к выдаче</h2>
-        <span class="q-live"><i></i>${q.pending ? `ждут оплату: ${q.pending}` : "онлайн"}</span></div>
+    if (isNew.length) { chime(); navigator.vibrate?.([60, 40, 60]); }
+    el.innerHTML = `<div class="q-head"><h2>Ждут кофе${q.waiting.length ? ` <span class="q-count">${q.waiting.length}</span>` : ""}</h2>
+        <span class="q-live"><i></i>${q.pending ? `ждут оплату в банке: ${q.pending}` : "обновляется само"}</span></div>
       ${q.waiting.length ? `<div class="q-list">${q.waiting.map(o => `
-        <article class="q-card${fresh.includes(o.id) ? " new" : ""}${o.free ? " free" : ""}">
-          <div class="q-num">${o.num ? "№" + o.num : ico("qr")}</div>
-          <div class="q-who"><b>${esc(o.name)}</b><span>${esc(o.group)} · ${size(o.size).toLowerCase()}${o.free ? " · бесплатный" : ` · ${o.amount} сом`}</span>
-            <em>${o.free ? "за баллы" : o.status === "pending" ? "оплата у бариста" : "оплачено QR"}${o.test ? " · демо" : ""} · ${ago(o.paidAt || o.created)}</em></div>
-          <span class="q-hint">${ico("qr", 16)}Сканируйте QR</span>
-        </article>`).join("")}</div>`
-      : `<p class="q-empty">Заказов нет. Новые появятся здесь сами — со звуком.</p>`}
-      ${q.waiting.length ? `<p class="q-note">Отсканируйте QR заказа на телефоне ученика — заказ подтвердится и баллы начислятся.</p>` : ""}`;
+        <article class="q-card${isNew.includes(o.id) ? " new" : ""}${o.free ? " free" : ""}">
+          <div class="q-num">${o.num ? "№" + o.num : esc(size(o.size).slice(0, 1))}</div>
+          <div class="q-who"><b>${esc(o.name)}</b><span>${esc(o.group)} · ${size(o.size).toLowerCase()}</span>
+            <em>${orderLine(o)}${o.test ? " · демо" : ""} · ${ago(o.paidAt || o.created)}</em></div>
+        </article>`).join("")}</div>
+        <p class="q-note">${ico("qr", 16)}Выдать можно только после сканирования QR ученика.</p>`
+      : `<div class="q-empty">${ico("coffee", 28)}<p>Заказов пока нет. Новые появятся здесь сами — со звуком.</p></div>`}`;
   }
 
   async function startCam() {
@@ -726,122 +785,149 @@
     if (!navigator.mediaDevices?.getUserMedia) return toast("Браузер не даёт камеру — введите код вручную", true);
     try {
       cam.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-    } catch { return toast("Нет доступа к камере. Разрешите её в настройках браузера", true); }
-    vp.innerHTML = `<video playsinline muted></video><div class="frame"></div>`;
+    } catch { ls.set("mc.cam", ""); return toast("Нет доступа к камере. Разрешите её в настройках браузера", true); }
+    if (!document.body.contains(vp)) return stopCam();
+    ls.set("mc.cam", "1");
+    vp.innerHTML = `<video playsinline muted></video><div class="frame"></div><button class="iconbtn cam-off" id="camOff" aria-label="Выключить камеру">${ico("x")}</button>`;
+    document.getElementById("camOff").onclick = () => { ls.set("mc.cam", ""); stopCam(); viewIdRedrawScan(); };
     const v = vp.querySelector("video"); v.srcObject = cam.stream; await v.play().catch(() => {});
     const c = document.createElement("canvas"), ctx = c.getContext("2d", { willReadFrequently: true });
-    let busy = false;
-    const tick = () => {
+    let last = 0;
+    const tick = now => {
       cam.raf = requestAnimationFrame(tick);
-      if (busy || v.readyState < 2 || !window.jsQR) return;
+      if (cam.busy || sheet || now - last < 120 || v.readyState < 2 || !window.jsQR) return;  // ~8 кадров в секунду хватает
+      last = now;
       const w = 480, h = Math.round(v.videoHeight / v.videoWidth * w) || 360;
       c.width = w; c.height = h; ctx.drawImage(v, 0, 0, w, h);
       const r = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: "dontInvert" });
-      if (r && r.data.startsWith(PICKUP)) {
-        busy = true; navigator.vibrate?.(60);
+      if (r && (r.data.startsWith(QR_PREFIX) || r.data.startsWith(PICKUP))) {
+        cam.busy = true; navigator.vibrate?.(60);
         vp.classList.remove("hit"); void vp.offsetWidth; vp.classList.add("hit");
-        scanned(r.data).catch(() => {}).finally(() => setTimeout(() => (busy = false), 2500));
-      } else if (r && r.data.startsWith(QR_PREFIX)) {
-        busy = true; navigator.vibrate?.(60);
-        vp.classList.remove("hit"); void vp.offsetWidth; vp.classList.add("hit");
-        lookup(r.data.slice(QR_PREFIX.length)).finally(() => setTimeout(() => (busy = false), 2500));
+        onScan(r.data).finally(() => setTimeout(() => (cam.busy = false), 1200));
       }
     };
-    tick();
+    cam.raf = requestAnimationFrame(tick);
+  }
+  function viewIdRedrawScan() {
+    const vp = document.getElementById("vp");
+    if (!vp) return;
+    vp.innerHTML = `<div class="idle">${ico("camera", 32)}<b>Сканер QR</b><span>Наведите камеру на QR в телефоне ученика</span>
+      <button class="btn foam" id="camOn">Включить камеру</button></div>`;
+    document.getElementById("camOn").onclick = startCam;
   }
   function stopCam() {
     cancelAnimationFrame(cam.raf);
     cam.stream?.getTracks().forEach(t => t.stop()); cam.stream = null;
   }
 
-  // QR заказа с телефона ученика: сервер подтверждает заказ и начисляет баллы, касса показывает карту.
-  async function scanned(qr) {
+  // Отсканировали QR ученика: открываем его панель — заказы к выдаче и продажа на кассе.
+  async function onScan(qr) {
     try {
       const r = await api("orders/scan", { qr });
-      const isNew = !state.guest || state.guest.code !== r.card.code;
-      const before = isNew ? r.card.points - r.delta : state.guest.points;
       state.guest = r.card; state.guestOrders = r.orders;
-      renderGuest(r.delta ? { kind: "add" } : null, isNew, before);
-      const g = document.getElementById("guest");
-      if (before < RULES.freeCost && r.card.points >= RULES.freeCost) beans(g);
-      toast(`№${r.order.num} выдан${r.delta ? ` · +${r.delta} — ${r.card.name.split(" ")[0]}` : ""}`);
-      g.scrollIntoView({ behavior: MOTION ? "smooth" : "auto", block: "nearest" });
-      loadQueue(); loadToday();
-      return r;
-    } catch (x) { toast(x.message, true); throw x; }
-  }
-
-  async function lookup(code) {
-    try {
-      const { card, orders } = await api("card/" + code);
-      const isNew = !state.guest || state.guest.code !== card.code;
-      state.guest = card; state.guestOrders = orders || []; renderGuest(null, isNew);
-      document.getElementById("guest").scrollIntoView({ behavior: MOTION ? "smooth" : "auto", block: "nearest" });
+      guestSheet();
     } catch (x) { toast(x.message, true); }
   }
 
-  function renderGuest(lastOp, enter, prevPts) {
-    const g = state.guest, el = document.getElementById("guest");
-    if (!el) return;
-    if (!g) { el.innerHTML = ""; return; }
-    const can = g.points >= RULES.freeCost, p = RULES.prices;
-    const freshFrom = lastOp?.kind === "add" ? Math.floor((g.points - RULES.perCup) / RULES.perCup) : null;
-    const qr = state.payBy === "qr" && RULES.pay !== "off";
-    el.innerHTML = `<div class="card guest${enter ? " enter" : ""}${can ? " ready" : ""}">
-      <div class="who"><div><b>${esc(g.name)}</b><span>${esc(g.group)} · ${fmtCode(g.code)}</span></div>
-        <button class="iconbtn" id="gx" aria-label="Закрыть карту">${ico("x")}</button></div>
-      ${ptsHtml(prevPts ?? g.points)}
-      ${stampCard(g.points, { row: true, desk: true, freshFrom })}
-      ${(state.guestOrders || []).map(o => `<div class="serve">
-        <div class="q-num">№${o.num}</div>
-        <div class="q-who"><b>${size(o.size)}${o.free ? " · бесплатный" : ""}</b><span>${o.free ? "за баллы" : `оплачено QR · ${o.amount} сом`}${o.test ? " · демо" : ""}</span></div>
-        <button class="btn q-serve" data-serve="${o.id}">${ico("check")}Выдать${o.free ? "" : ` · +${RULES.perCup}`}</button>
-      </div>`).join("")}
-      ${RULES.pay !== "off" ? `<div class="seg" role="radiogroup" aria-label="Способ оплаты">
-        <button role="radio" aria-checked="${!qr}" data-payby="cash">Наличные или терминал</button>
-        <button role="radio" aria-checked="${qr}" data-payby="qr">${ico("qr", 16)}QR на экране</button></div>` : ""}
-      <div class="acts">
-        <button class="act" data-k="add" data-s="s"><b>Маленький</b><span>${p.s} сом${qr ? " · QR" : ""}</span><em>+${RULES.perCup}</em></button>
-        <button class="act" data-k="add" data-s="l"><b>Большой</b><span>${p.l} сом${qr ? " · QR" : ""}</span><em>+${RULES.perCup}</em></button>
-        <button class="act redeem" data-k="redeem" data-s="s" ${can ? "" : "disabled"}><b>Бесплатный маленький</b><em>−${RULES.freeCost}</em></button>
-        <button class="act redeem" data-k="redeem" data-s="l" ${can ? "" : "disabled"}><b>Бесплатный большой</b><em>−${RULES.freeCost}</em></button>
+  function guestSheet() {
+    const el = openSheet("Ученик");
+    el.classList.add("guest-wrap");
+    el.addEventListener("click", e => { if (e.target === el) closeSheet(); });
+    sheet = { el, guest: true, timer: 0, tick: 0 };
+    sheet.onClose = () => { state.guest = null; state.guestOrders = []; };
+    drawGuest();
+  }
+
+  function drawGuest(after) {
+    if (!sheet?.guest) return;
+    const g = state.guest, box = sheet.el.querySelector(".sheet"), p = RULES.prices;
+    const can = g.points >= RULES.freeCost, orders = state.guestOrders || [];
+    const sz = sheet.sz || "s";
+    const freshFrom = after?.delta > 0 ? Math.floor((g.points - after.delta) / RULES.perCup) : null;
+    box.innerHTML = `
+      <button class="iconbtn sheet-x" data-close aria-label="Закрыть">${ico("x")}</button>
+      <div class="who"><b>${esc(g.name)}</b><span>${esc(g.group)} · ${fmtCode(g.code)}</span></div>
+      <div class="g-card${can ? " ready" : ""}">
+        ${ptsHtml(after ? after.before : g.points)}
+        <div class="stamps row">${slotsHtml(g.points, freshFrom)}</div>
+        <p class="card-foot">${leftText(g.points, true)}</p>
       </div>
-      ${can ? "" : `<p class="sub">Бесплатный кофе откроется на ${RULES.freeCost} баллах.</p>`}
-    </div>`;
-    countTo(el.querySelector(".pts"), prevPts, g.points, 500);
-    document.getElementById("gx").onclick = () => { state.guest = null; state.guestOrders = []; renderGuest(); };
-    el.querySelectorAll("[data-serve]").forEach(b => b.onclick = async () => {
-      b.disabled = true;
+      ${after ? `<div class="g-done">${ico("check", 22)}<b>${after.text}</b></div>` : ""}
+      ${orders.length ? `<div class="g-sec"><h3>Ждёт выдачи</h3>${orders.map(o => `<div class="serve">
+          <div class="s-what"><b>${o.num ? "№" + o.num + " · " : ""}${size(o.size)}${o.free ? " · бесплатный" : ""}</b><span>${orderLine(o)}${o.test ? " · демо" : ""}</span></div>
+          ${o.status === "pending" && DESK(o.provider)
+            ? `<div class="pay2"><button class="btn pay" data-serve="${o.id}" data-pay="cash">${ico("cash")}Наличными · выдать</button>
+                 <button class="btn pay" data-serve="${o.id}" data-pay="card">${ico("card")}Картой · выдать</button></div>`
+            : `<button class="btn pay" data-serve="${o.id}">${ico("check")}Выдать${o.free ? "" : ` · +${RULES.perCup}`}</button>`}
+        </div>`).join("")}</div>` : ""}
+      <div class="g-sec">
+        <h3>${orders.length ? "Ещё продажа" : "Продажа на кассе"}</h3>
+        <div class="seg" role="radiogroup" aria-label="Размер">
+          <button role="radio" aria-checked="${sz === "s"}" data-sz="s">Маленький · ${p.s}</button>
+          <button role="radio" aria-checked="${sz === "l"}" data-sz="l">Большой · ${p.l}</button></div>
+        <div class="pay2">
+          <button class="act" data-sell="cash">${ico("cash")}<b>Наличными</b><em>+${RULES.perCup}</em></button>
+          <button class="act" data-sell="card">${ico("card")}<b>Картой</b><em>+${RULES.perCup}</em></button>
+        </div>
+        ${RULES.pay === "gopay" ? `<button class="linkbtn" data-qr>Оплата по QR на экране кассы</button>` : ""}
+      </div>
+      ${can ? `<div class="g-sec"><h3>За баллы</h3><div class="pay2">
+          <button class="act redeem" data-redeem="s">${ico("gift")}<b>Маленький</b><em>−${RULES.freeCost}</em></button>
+          <button class="act redeem" data-redeem="l">${ico("gift")}<b>Большой</b><em>−${RULES.freeCost}</em></button></div></div>` : ""}`;
+    countTo(box.querySelector(".pts"), after ? after.before : null, g.points, 500);
+    box.querySelectorAll("[data-close]").forEach(b => b.onclick = closeSheet);
+    box.querySelectorAll("[data-sz]").forEach(b => b.onclick = () => { sheet.sz = b.dataset.sz; drawGuest(); });
+    const lock = () => box.querySelectorAll("button.btn, button.act").forEach(x => (x.disabled = true));
+    const done = (r, text, before) => {
+      state.guest = r.card; if (r.orders) state.guestOrders = r.orders;
+      drawGuest({ delta: r.delta ?? r.op?.delta ?? 0, before, text });
+      if (before < RULES.freeCost && r.card.points >= RULES.freeCost) beans(box);
+      loadToday(); loadQueue();
+      // Больше выдавать нечего — панель закрывается сама, касса снова ждёт QR.
+      clearTimeout(sheet.timer);
+      if (!state.guestOrders.length) { const s = sheet; s.timer = setTimeout(() => sheet === s && closeSheet(), 2200); }
+    };
+    box.querySelectorAll("[data-serve]").forEach(b => b.onclick = async e => {
+      ripple(b, e); lock();
       const before = g.points;
       try {
-        const r = await api(`orders/${b.dataset.serve}/serve`, { code: g.code });
-        state.guest = r.card; state.guestOrders = r.orders;
-        renderGuest(r.delta ? { kind: "add" } : null, false, before);
-        if (before < RULES.freeCost && r.card.points >= RULES.freeCost) beans(el);
-        toast(r.delta ? `Выдан · +${r.delta} — ${g.name.split(" ")[0]}` : "Заказ выдан");
-        loadQueue(); loadToday();
-      } catch (x) { toast(x.message, true); b.disabled = false; }
+        const r = await api(`orders/${b.dataset.serve}/serve`, { code: g.code, pay: b.dataset.pay });
+        done(r, r.delta ? `Выдано · +${r.delta} ${ptsWord(r.delta)}` : "Выдано", before);
+      } catch (x) { toast(x.message, true); drawGuest(); }
     });
-    el.querySelectorAll("[data-payby]").forEach(b => b.onclick = () => { state.payBy = b.dataset.payby; renderGuest(); });
-    el.querySelectorAll(".act").forEach(b => b.onclick = async e => {
-      ripple(b, e);
-      if (qr && b.dataset.k === "add") { // QR на экране кассы: ученик сканирует своим банком, баллы придут сами
-        try {
-          const r = await api("orders", { size: b.dataset.s, code: g.code });
-          paySheet(r.order, { desk: true, onPaid: () => { lookup(g.code); loadToday(); loadQueue(); } });
-        } catch (x) { toast(x.message, true); }
-        return;
-      }
-      el.querySelectorAll(".act").forEach(x => (x.disabled = true));
+    box.querySelectorAll("[data-sell]").forEach(b => b.onclick = async e => {
+      ripple(b, e); lock();
       const before = g.points;
       try {
-        const r = await api(`card/${g.code}/${b.dataset.k}`, { size: b.dataset.s });
-        state.guest = r.card; renderGuest(r.op, false, before);
-        if (r.op.kind === "add" && before < RULES.freeCost && r.card.points >= RULES.freeCost) beans(el);
-        toast(r.op.kind === "add" ? `+${r.op.delta} — ${g.name.split(" ")[0]}` : `Бесплатный ${size(r.op.size).toLowerCase()} выдан`);
-        loadToday();
-      } catch (x) { toast(x.message, true); renderGuest(); }
+        const r = await api(`card/${g.code}/add`, { size: sz, pay: b.dataset.sell });
+        done(r, `${size(sz)}, ${b.dataset.sell === "card" ? "картой" : "наличными"} · +${r.op.delta}`, before);
+      } catch (x) { toast(x.message, true); drawGuest(); }
     });
+    box.querySelectorAll("[data-redeem]").forEach(b => b.onclick = async e => {
+      ripple(b, e); lock();
+      const before = g.points;
+      try {
+        const r = await api(`card/${g.code}/redeem`, { size: b.dataset.redeem });
+        done(r, `Бесплатный ${size(b.dataset.redeem).toLowerCase()} выдан`, before);
+      } catch (x) { toast(x.message, true); drawGuest(); }
+    });
+    const qrb = box.querySelector("[data-qr]");
+    if (qrb) qrb.onclick = async () => {
+      try { const r = await api("orders", { size: sz, code: g.code }); closeSheet(); deskQrSheet(r.order, g); }
+      catch (x) { toast(x.message, true); }
+    };
+  }
+
+  // Касса показывает банковский QR на своём экране (только когда подключён GoPay).
+  function deskQrSheet(order, g) {
+    const el = openSheet("Оплата по QR");
+    sheet = { el, order, opts: { desk: true }, timer: 0, tick: 0 };
+    const box = el.querySelector(".sheet");
+    box.innerHTML = `<button class="iconbtn sheet-x" data-close aria-label="Закрыть">${ico("x")}</button>
+      <div class="sh-head"><b>${size(order.size)} · ${order.amount} сом</b><span>${esc(g.name)}</span></div>
+      <div class="payqr big">${qrOf(order.qrData || "")}</div>
+      <p class="cap">Ученик сканирует код в приложении банка. Когда оплата придёт, заказ появится в очереди — выдайте его по QR ученика.</p>`;
+    box.querySelector("[data-close]").onclick = closeSheet;
   }
 
   async function loadToday() {
@@ -850,26 +936,23 @@
     const seen = state.today?.ops[0]?.id || 0;
     try { state.today = await api("today"); } catch { return; }
     const t = state.today;
-    el.innerHTML = `<h2>Сегодня</h2>
-      <div class="sum">
-        <div class="fact"><b>${t.sold}</b><span>${plural(t.sold, "стакан", "стакана", "стаканов")} по картам</span></div>
-        <div class="fact"><b>${t.free}</b><span>бесплатных</span></div>
-        <div class="fact"><b>${t.revenue}</b><span>сом по картам</span></div>
-      </div>
-      <h2 style="margin-top:18px">Операции</h2>
-      ${t.ops.length ? `<ul class="list">${t.ops.map(o => `<li class="${o.undone ? "undone" : ""}${seen && o.id > seen ? " new" : ""}">
-        <span class="dot${o.kind === "redeem" ? " free" : ""}">${ico(o.kind === "redeem" ? "gift" : "coffee", 18)}</span>
-        <span class="what"><b>${esc(o.name)}</b><span>${esc(o.group)} · ${size(o.size).toLowerCase()} · ${fmtTime(o.ts).replace("сегодня, ", "")}${o.undone ? " · отменено" : ""}</span></span>
+    el.innerHTML = `
+      <div class="t-fact"><b>${t.sold}</b><span>${plural(t.sold, "стакан", "стакана", "стаканов")}</span></div>
+      <div class="t-fact"><b>${fmtSom(t.revenue)}</b><span>сом сегодня</span></div>
+      <div class="t-fact"><b>${fmtSom(t.cash)}</b><span>наличными</span></div>
+      <div class="t-fact"><b>${fmtSom((t.card || 0) + (t.qr || 0))}</b><span>картой и QR</span></div>`;
+    const ops = document.getElementById("opsList");
+    if (!ops) return;
+    ops.innerHTML = t.ops.length ? `<ul class="list">${t.ops.map(o => `<li class="${o.undone ? "undone" : ""}${seen && o.id > seen ? " new" : ""}">
+        <span class="dot${o.kind === "redeem" ? " free" : ""}">${ico(o.kind === "redeem" ? "gift" : o.pay === "card" ? "card" : o.pay === "cash" ? "cash" : "coffee", 18)}</span>
+        <span class="what"><b>${esc(o.name)}</b><span>${size(o.size).toLowerCase()} · ${o.kind === "redeem" ? "за баллы" : o.pay === "card" ? "картой" : o.pay === "qr" ? "QR" : "наличными"} · ${fmtTime(o.ts).replace("сегодня, ", "")}${o.undone ? ` · отменил${o.undoneBy ? "(а) " + esc(o.undoneBy) : "и"}` : ""}</span></span>
         ${o.canUndo ? `<button class="undo" data-op="${o.id}" aria-label="Отменить операцию">${ico("undo", 16)}<span class="t">Отменить</span></button>` : ""}
         <span class="d ${o.delta > 0 ? "plus" : "minus"}">${o.delta > 0 ? "+" : "−"}${Math.abs(o.delta)}</span></li>`).join("")}</ul>`
-      : `<div class="empty">Пока ни одного стакана. Отсканируйте первый QR.</div>`}`;
-    el.querySelectorAll("[data-op]").forEach(b => b.onclick = async () => {
+      : `<div class="empty">Пока ни одного стакана. Отсканируйте первый QR.</div>`;
+    ops.querySelectorAll("[data-op]").forEach(b => b.onclick = async () => {
       b.disabled = true;
-      try {
-        const r = await api(`op/${b.dataset.op}/undo`, {});
-        if (state.guest && state.guest.code === r.card.code) { const before = state.guest.points; state.guest = r.card; renderGuest(null, false, before); }
-        toast("Операция отменена"); loadToday();
-      } catch (x) { toast(x.message, true); b.disabled = false; }
+      try { await api(`op/${b.dataset.op}/undo`, {}); toast("Операция отменена"); loadToday(); }
+      catch (x) { toast(x.message, true); b.disabled = false; }
     });
   }
 
@@ -884,18 +967,20 @@
           <h1>Вход для сотрудников</h1>
           <p class="sub">Касса бариста и кабинет администрации. Логин и пароль выдаёт администрация.</p>
           <form class="form" id="sform" novalidate>
-            <div class="field"><label for="s-login">Логин</label><input id="s-login" name="phone" autocomplete="username" autocapitalize="none" spellcheck="false" required></div>
-            <div class="field"><label for="s-pass">Пароль</label><input id="s-pass" name="password" type="password" autocomplete="current-password" required></div>
-            <p class="err" id="s-err"></p>
+            <div class="field"><label for="s-login">Логин</label><input id="s-login" name="phone" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="40" required></div>
+            <div class="field"><label for="s-pass">Пароль</label><div class="pw"><input id="s-pass" name="password" type="password" autocomplete="current-password" maxlength="128" required>
+              <button type="button" class="pw-eye" aria-label="Показать пароль" aria-pressed="false">Показать</button></div></div>
+            <p class="err" id="s-err" role="alert"></p>
             <button class="btn wide" type="submit">Войти</button>
           </form>
         </div>
       </section>`;
     const f = document.getElementById("sform");
+    bindEye(f);
     setTimeout(() => f.querySelector("input").focus(), 300);
     f.onsubmit = async e => {
       e.preventDefault();
-      const btn = f.querySelector("button"), err = f.querySelector(".err");
+      const btn = f.querySelector("button[type=submit]"), err = f.querySelector(".err");
       btn.disabled = true; err.textContent = ""; f.classList.remove("bad");
       try {
         const r = await api("login", Object.fromEntries(new FormData(f)));
@@ -907,10 +992,9 @@
   }
 
   // ---------- кабинет администрации ----------
-  const TABS = [["money", "Выручка"], ["desk", "Касса"], ["orders", "Заказы"], ["staff", "Сотрудники"], ["settings", "Настройки"]];
-  const fmtSom = n => Number(n || 0).toLocaleString("ru-RU").replace(/,/g, " ");
-  const STATUS = { pending: ["Ждёт оплату", "wait"], paid: ["Оплачен", "ok"], served: ["Выдан", "done"],
-    failed: ["Ошибка банка", "bad"], expired: ["Не оплачен", "off"], cancelled: ["Отменён", "off"] };
+  const TABS = [["money", "Выручка"], ["desk", "Касса"], ["students", "Ученики"], ["orders", "Заказы"], ["staff", "Сотрудники"], ["settings", "Настройки"]];
+  const STATUS = { pending: ["Ждёт", "wait"], paid: ["Оплачен", "ok"], served: ["Выдан", "done"],
+    failed: ["Ошибка банка", "bad"], expired: ["Не забрали", "off"], cancelled: ["Отменён", "off"] };
 
   function viewAdmin() {
     const tab = state.tab || "money";
@@ -919,13 +1003,14 @@
         `<button role="tab" aria-selected="${k === tab}" data-adm="${k}">${t}</button>`).join("")}</nav>
       <div id="adm" class="adm"></div>`;
     document.getElementById("logout").onclick = logout;
-    $app.querySelectorAll("[data-adm]").forEach(b => b.onclick = () => { state.tab = b.dataset.adm; stopCam(); viewAdmin(); });
+    $app.querySelectorAll("[data-adm]").forEach(b => b.onclick = () => { state.tab = b.dataset.adm; stopCam(); closeSheet(); viewAdmin(); });
     const host = document.getElementById("adm");
     clearInterval(pollTimer);
     if (tab === "desk") {
       host.innerHTML = deskHtml(); bindDesk();
       pollTimer = setInterval(() => document.visibilityState === "visible" && (loadQueue(), loadToday()), 4000);
     } else if (tab === "money") admMoney(host);
+    else if (tab === "students") admStudents(host);
     else if (tab === "orders") admOrders(host);
     else if (tab === "staff") admStaff(host);
     else admSettings(host);
@@ -936,53 +1021,54 @@
     host.innerHTML = `<div class="loading small">${ico("coffee", 32)}</div>`;
     let s;
     try { s = await api(`admin/stats?days=${days}&test=${test ? 1 : 0}`); } catch (x) { host.innerHTML = `<div class="empty">${esc(x.message)}</div>`; return; }
-    const share = s.revenue ? Math.round(s.qr / s.revenue * 100) : 0;
+    const card = (s.card || 0) + (s.qr || 0), share = s.revenue ? Math.round(card / s.revenue * 100) : 0;
     host.innerHTML = `
       <div class="filters">
         <div class="chips" role="radiogroup" aria-label="Период">${[[1, "Сегодня"], [7, "7 дней"], [30, "30 дней"]].map(([d, t]) =>
           `<button role="radio" aria-checked="${d === days}" data-days="${d}">${t}</button>`).join("")}</div>
-        ${s.demoOps || test ? `<label class="chk"><input type="checkbox" id="wtest" ${test ? "checked" : ""}> Учитывать демо-оплаты</label>` : ""}
+        ${s.demoOps || test ? `<label class="chk"><input type="checkbox" id="wtest" ${test ? "checked" : ""}> Учитывать демо-продажи</label>` : ""}
       </div>
       <div class="kpis">
         <div class="kpi main"><span>Выручка</span><b>${fmtSom(s.revenue)} <small>сом</small></b>
-          <div class="split" role="img" aria-label="QR ${fmtSom(s.qr)} сом, касса ${fmtSom(s.cash)} сом"><i class="qr" style="width:${share}%"></i><i class="cash" style="width:${100 - share}%"></i></div>
-          <em><i class="sw qr"></i>QR ${fmtSom(s.qr)} · <i class="sw cash"></i>касса ${fmtSom(s.cash)}</em></div>
+          <div class="split" role="img" aria-label="Картой и QR ${fmtSom(card)} сом, наличными ${fmtSom(s.cash)} сом"><i class="qr" style="width:${share}%"></i><i class="cash" style="width:${100 - share}%"></i></div>
+          <em><i class="sw qr"></i>картой и QR ${fmtSom(card)} · <i class="sw cash"></i>наличными ${fmtSom(s.cash)}</em></div>
         <div class="kpi"><span>Стаканов</span><b>${s.cups}</b><em>${s.cups ? "≈ " + fmtSom(Math.round(s.revenue / Math.max(1, s.cups))) + " сом за стакан" : "пока нет"}</em></div>
         <div class="kpi"><span>Бесплатных</span><b>${s.free}</b><em>подарено на ${fmtSom(s.freeCost)} сом</em></div>
-        <div class="kpi"><span>Учеников с картой</span><b>${s.students}</b><em>${s.newStudents ? "+" + s.newStudents + " за период" : "новых нет"}</em></div>
+        <div class="kpi"><span>Учеников с картой</span><b>${fmtSom(s.students)}</b><em>${s.newStudents ? "+" + s.newStudents + " за период" : "новых нет"}</em></div>
       </div>
       ${days > 1 ? `<section class="card chart-card">
         <div class="card-head"><span>Выручка по дням</span><button class="linkbtn" id="asTable">Таблицей</button></div>
-        <div class="legend"><span><i class="sw qr"></i>QR — ${fmtSom(s.qr)} сом</span><span><i class="sw cash"></i>Касса — ${fmtSom(s.cash)} сом</span></div>
+        <div class="legend"><span><i class="sw qr"></i>Картой и QR — ${fmtSom(card)} сом</span><span><i class="sw cash"></i>Наличными — ${fmtSom(s.cash)} сом</span></div>
         <div id="chart"></div>
       </section>` : ""}
       <div class="two-col">
         <section class="card"><div class="card-head"><span>Чаще всех берут кофе</span></div>
           ${s.top.length ? `<ol class="rank">${s.top.map(t => `<li><b>${esc(t.name)}</b><span>${esc(t.grp)}</span><em>${t.cups}</em></li>`).join("")}</ol>` : `<p class="sub">Пока нет покупок за период.</p>`}</section>
         <section class="card"><div class="card-head"><span>Кто пробил стаканы</span></div>
-          ${s.byStaff.length ? `<ol class="rank">${s.byStaff.map(t => `<li><b>${esc(t.name)}</b><span>${t.role === "system" ? "сами, через QR" : t.role === "admin" ? "администрация" : "бариста"}</span><em>${t.n} · ${fmtSom(t.sum)} сом</em></li>`).join("")}</ol>` : `<p class="sub">Пока нет операций.</p>`}</section>
+          ${s.byStaff.length ? `<ol class="rank">${s.byStaff.map(t => `<li><b>${esc(t.name)}</b><span>${t.role === "system" ? "оплата в банке" : t.role === "admin" ? "администрация" : "бариста"}</span><em>${t.n} · ${fmtSom(t.sum)} сом</em></li>`).join("")}</ol>` : `<p class="sub">Пока нет операций.</p>`}</section>
       </div>
-      ${s.pay !== "gopay" ? `<p class="note">${ico("qr", 16)}${s.pay === "demo" ? "Оплата по QR работает в демо-режиме: демо-оплаты не входят в выручку." : "Оплата по QR не подключена."} Подключение — в «Настройках».</p>` : ""}`;
+      ${s.pay === "demo" ? `<p class="note">${ico("gift", 16)}Включён демо-режим: продажи помечаются «демо» и не входят в выручку.</p>` : ""}`;
     host.querySelectorAll("[data-days]").forEach(b => b.onclick = () => admMoney(host, +b.dataset.days, test));
     const wt = host.querySelector("#wtest"); if (wt) wt.onchange = () => admMoney(host, days, wt.checked);
+    const series = s.series.map(d => ({ day: d.day, a: (d.card || 0) + d.qr, b: d.cash, cups: d.cups }));
     const tb = host.querySelector("#asTable");
     if (tb) tb.onclick = () => {
       const c = host.querySelector("#chart"), on = tb.textContent === "Таблицей";
       tb.textContent = on ? "Графиком" : "Таблицей";
-      c.innerHTML = on ? `<table class="tbl"><thead><tr><th>День</th><th>QR</th><th>Касса</th><th>Стаканов</th></tr></thead><tbody>${
-        s.series.slice().reverse().map(d => `<tr><td>${fmtDay(d.day)}</td><td>${fmtSom(d.qr)}</td><td>${fmtSom(d.cash)}</td><td>${d.cups}</td></tr>`).join("")}</tbody></table>` : barChart(s.series, c.clientWidth);
+      c.innerHTML = on ? `<table class="tbl"><thead><tr><th>День</th><th>Картой и QR</th><th>Наличными</th><th>Стаканов</th></tr></thead><tbody>${
+        series.slice().reverse().map(d => `<tr><td>${fmtDay(d.day)}</td><td>${fmtSom(d.a)}</td><td>${fmtSom(d.b)}</td><td>${d.cups}</td></tr>`).join("")}</tbody></table>` : barChart(series, c.clientWidth);
       bindChart(c);
     };
     const ch = host.querySelector("#chart");
-    if (ch) { ch.innerHTML = barChart(s.series, ch.clientWidth); bindChart(ch); }
+    if (ch) { ch.innerHTML = barChart(series, ch.clientWidth); bindChart(ch); }
   }
   const fmtDay = d => new Date(d + "T00:00:00").toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
 
-  // Сложенные столбцы: снизу QR (индиго), сверху касса (карамель); зазор 2px между частями, скруглён только верх.
+  // Сложенные столбцы: снизу картой и QR (индиго), сверху наличные (карамель); зазор 2px, скруглён только верх.
   function barChart(series, width) {
     // Ширина — реальная ширина блока в пикселях: подписи осей остаются читаемыми и на телефоне.
     const W = Math.max(300, Math.round(width || 640)), H = W < 480 ? 200 : 240, pad = { l: 44, r: 8, t: 12, b: 26 }, n = series.length;
-    const max = Math.max(100, ...series.map(d => d.qr + d.cash));
+    const max = Math.max(100, ...series.map(d => d.a + d.b));
     const step = Math.pow(10, Math.floor(Math.log10(max))), top = Math.ceil(max / step) * step;
     const y = v => pad.t + (H - pad.t - pad.b) * (1 - v / top), bw = (W - pad.l - pad.r) / n, w = Math.max(4, Math.min(28, bw * .62));
     const grid = [0, .5, 1].map(k => `<line x1="${pad.l}" x2="${W - pad.r}" y1="${y(top * k)}" y2="${y(top * k)}"/><text x="${pad.l - 8}" y="${y(top * k) + 4}">${fmtSom(top * k)}</text>`).join("");
@@ -992,13 +1078,13 @@
       return `<path class="${cls}" d="M${x} ${y0}V${y1 + r}${r ? `q0 -${r} ${r} -${r}h${w - 2 * r}q${r} 0 ${r} ${r}` : `h${w}`}V${y0}Z"/>`;
     };
     const bars = series.map((d, i) => {
-      const x = pad.l + bw * i + (bw - w) / 2, yq = y(d.qr), yc = y(d.qr + d.cash);
+      const x = pad.l + bw * i + (bw - w) / 2, ya = y(d.a), yb = y(d.a + d.b);
       const label = i % Math.ceil(n / (W < 480 ? 4 : 8)) === 0 || i === n - 1 ? `<text class="xl" x="${x + w / 2}" y="${H - 8}">${fmtDay(d.day)}</text>` : "";
-      return `<g class="bar" tabindex="0" data-tip="${fmtDay(d.day)}: QR ${fmtSom(d.qr)} · касса ${fmtSom(d.cash)} · ${d.cups} стак.">
+      return `<g class="bar" tabindex="0" data-tip="${fmtDay(d.day)}: картой и QR ${fmtSom(d.a)} · наличными ${fmtSom(d.b)} · ${d.cups} стак.">
         <rect class="hit" x="${pad.l + bw * i}" y="${pad.t}" width="${bw}" height="${H - pad.t - pad.b}"/>
-        ${bar(x, y(0), yq, "qr", !d.cash)}${bar(x, yq - (d.qr && d.cash ? 2 : 0), yc, "cash", true)}${label}</g>`;
+        ${bar(x, y(0), ya, "qr", !d.b)}${bar(x, ya - (d.a && d.b ? 2 : 0), yb, "cash", true)}${label}</g>`;
     }).join("");
-    return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Выручка по дням, QR и касса"><g class="grid">${grid}</g>${bars}</svg><div class="tip" hidden></div></div>`;
+    return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Выручка по дням"><g class="grid">${grid}</g>${bars}</svg><div class="tip" hidden></div></div>`;
   }
   function bindChart(c) {
     const tip = c?.querySelector(".tip"); if (!tip) return;
@@ -1012,14 +1098,46 @@
     });
   }
 
+  // Ученики: поиск по имени, телефону, группе или коду; новый пароль и отключение.
+  async function admStudents(host, q = state.sq || "", shown) {
+    state.sq = q;
+    if (!host.querySelector("#sq")) {
+      host.innerHTML = `<form class="search" id="sfind" role="search">
+          <label class="sr" for="sq">Поиск ученика</label>${ico("search")}
+          <input id="sq" type="search" placeholder="Имя, телефон, группа или код карты" value="${esc(q)}" autocomplete="off" maxlength="40">
+        </form><div id="slist"></div>`;
+      let t;
+      host.querySelector("#sq").oninput = e => { clearTimeout(t); t = setTimeout(() => admStudents(host, e.target.value.trim()), 280); };
+      host.querySelector("#sfind").onsubmit = e => { e.preventDefault(); admStudents(host, host.querySelector("#sq").value.trim()); };
+    }
+    const list = host.querySelector("#slist");
+    let r; try { r = await api("admin/students?q=" + encodeURIComponent(q)); } catch (x) { list.innerHTML = `<div class="empty">${esc(x.message)}</div>`; return; }
+    list.innerHTML = `
+      ${shown ? `<div class="secret card"><b>Новый пароль для ${esc(shown.name)}</b><p>Пароль <code>${esc(shown.password)}</code> — продиктуйте ученику. Вход по номеру телефона.</p></div>` : ""}
+      <p class="sub count">${q ? `Найдено: ${r.students.length}${r.students.length === 50 ? "+" : ""}` : `Всего с картой: ${fmtSom(r.total)}${r.total > 50 ? " · показаны последние 50, остальных найдёт поиск" : ""}`}</p>
+      ${r.students.length ? `<ul class="list students">${r.students.map(u => `<li class="${u.active ? "" : "undone"}">
+        <span class="dot">${esc(u.name.slice(0, 1))}</span>
+        <span class="what"><b>${esc(u.name)}</b><span>${esc(u.group)} · ${esc(u.phone)} · ${fmtCode(u.code)}${u.active ? "" : " · отключён"}</span></span>
+        <span class="d" title="Баллов на карте">${u.points}</span>
+        <button class="linkbtn" data-sreset="${u.id}" data-name="${esc(u.name)}">Пароль</button>
+        <button class="linkbtn" data-stoggle="${u.id}">${u.active ? "Отключить" : "Включить"}</button></li>`).join("")}</ul>`
+      : `<div class="empty">${q ? "Никого не нашли. Проверьте написание или поищите по номеру." : "Учеников пока нет."}</div>`}`;
+    list.querySelectorAll("[data-sreset]").forEach(b => b.onclick = async () => {
+      if (!confirm(`Выдать новый пароль для ${b.dataset.name}? Старый перестанет работать.`)) return;
+      try { const x = await api(`admin/students/${b.dataset.sreset}/reset`, {}); admStudents(host, q, { name: b.dataset.name, password: x.password }); }
+      catch (x) { toast(x.message, true); } });
+    list.querySelectorAll("[data-stoggle]").forEach(b => b.onclick = async () => {
+      try { await api(`admin/students/${b.dataset.stoggle}/toggle`, {}); admStudents(host, q); } catch (x) { toast(x.message, true); } });
+  }
+
   async function admOrders(host) {
     host.innerHTML = `<div class="loading small">${ico("coffee", 32)}</div>`;
     let r; try { r = await api("admin/orders"); } catch (x) { host.innerHTML = `<div class="empty">${esc(x.message)}</div>`; return; }
     host.innerHTML = r.orders.length ? `<ul class="list orders">${r.orders.map(o => { const [t, c] = STATUS[o.status] || [o.status, "off"]; return `
       <li><span class="dot${o.free ? " free" : ""}">${o.num ? "№" + o.num : ico(o.free ? "gift" : "coffee", 18)}</span>
-        <span class="what"><b>${esc(o.name)} · ${size(o.size).toLowerCase()}</b><span>${esc(o.group)} · ${fmtTime(o.created)} · ${o.via === "desk" ? "QR на кассе" : o.free ? "за баллы" : "с телефона"}${o.test ? " · демо" : ""}</span></span>
+        <span class="what"><b>${esc(o.name)} · ${size(o.size).toLowerCase()}</b><span>${esc(o.group)} · ${fmtTime(o.created)} · ${o.free ? "за баллы" : o.provider === "gopay" ? "банк" : "на кассе"}${o.test ? " · демо" : ""}</span></span>
         <span class="st ${c}">${t}</span><span class="d">${o.free ? "0" : fmtSom(o.amount)}</span></li>`; }).join("")}</ul>`
-      : `<div class="empty">Заказов ещё не было. Они появятся, когда ученики начнут платить по QR.</div>`;
+      : `<div class="empty">Заказов ещё не было. Они появятся, когда ученики начнут заказывать с телефона.</div>`;
   }
 
   async function admStaff(host, shown) {
@@ -1035,8 +1153,8 @@
         ${u.me ? "" : `<button class="linkbtn" data-toggle="${u.id}">${u.active ? "Отключить" : "Включить"}</button>`}</li>`).join("")}</ul>
       <section class="card"><div class="card-head"><span>Добавить сотрудника</span></div>
         <form class="form" id="addStaff" novalidate>
-          <div class="two"><div class="field"><label for="n-name">Имя</label><input id="n-name" name="name" required></div>
-          <div class="field"><label for="n-login">Логин</label><input id="n-login" name="login" placeholder="aigerim" autocapitalize="none" spellcheck="false" required></div></div>
+          <div class="two"><div class="field"><label for="n-name">Имя</label><input id="n-name" name="name" maxlength="60" required></div>
+          <div class="field"><label for="n-login">Логин</label><input id="n-login" name="login" placeholder="aigerim" autocapitalize="none" spellcheck="false" maxlength="24" required></div></div>
           <div class="seg" role="radiogroup" aria-label="Роль"><button type="button" role="radio" aria-checked="true" data-role="staff">Бариста</button><button type="button" role="radio" aria-checked="false" data-role="admin">Администрация</button></div>
           <p class="err"></p><button class="btn" type="submit">Добавить и выдать пароль</button>
         </form></section>`;
@@ -1066,14 +1184,16 @@
           <div class="field"><label for="r-f">Баллов за бесплатный</label><input id="r-f" name="free_cost" inputmode="numeric" value="${RULES.freeCost}"></div></div>
           <p class="err"></p><button class="btn" type="submit">Сохранить</button>
         </form></section>
-      <section class="card pay-status ${mode}"><div class="card-head"><span>Оплата по QR</span>
-          <span class="st ${mode === "gopay" ? "ok" : mode === "demo" ? "wait" : "off"}">${mode === "gopay" ? "Подключена" : mode === "demo" ? "Демо-режим" : "Не подключена"}</span></div>
-        ${mode === "gopay" ? `<p class="sub">Платежи идут через GoPay (ELQR): MBank, MegaPay, Оптима и ещё 20+ банков. Оплата подтверждается автоматически, баллы начисляются сами.</p>`
-        : `<p class="sub">${mode === "demo" ? "Сейчас оплата имитируется: подтверждается сама, деньги не списываются и в выручку не входят." : "Ученики пока платят только на кассе."}
-            Чтобы принимать настоящие оплаты по QR:</p>
-          <ol class="steps"><li>Зарегистрировать кофейню в <a href="https://merchant.gopay.kg/signup" target="_blank" rel="noopener">GoPay</a> (ИП или ОсОО, подключение за 1 рабочий день, комиссия 1–2%).</li>
-            <li>В кабинете GoPay: «Разработчику» → скопировать API-ключ и секрет, в «Вебхуки» указать адрес<br><code>https://mukrcoffee.62-113-109-193.sslip.io/api/pay/gopay</code> и событие <code>payment.committed</code>.</li>
-            <li>Передать ключи разработчику — он внесёт их в настройки сервера.</li></ol>`}
+      <section class="card pay-status"><div class="card-head"><span>Как принимаются деньги</span>
+          <span class="st ${mode === "gopay" ? "ok" : DESK(mode) ? "ok" : "off"}">${mode === "gopay" ? "Касса + банк" : mode === "demo" ? "Демо" : DESK(mode) ? "На кассе" : "Выключено"}</span></div>
+        <p class="sub">${DESK(mode) || mode === "gopay"
+          ? "Ученик заказывает в телефоне и показывает QR. Бариста сканирует, принимает наличные или карту и нажимает «выдать» — тогда засчитываются и деньги, и баллы."
+          : "Заказ с телефона выключен — ученики платят на кассе, бариста ставит оттиск по QR."}
+          ${mode === "demo" ? " Сейчас включён демо-режим: продажи не входят в выручку." : ""}</p>
+        ${mode !== "gopay" ? `<p class="sub">Можно добавить оплату по QR банка (GoPay, ELQR — MBank, MegaPay, Оптима и другие):</p>
+          <ol class="steps"><li>Зарегистрировать кофейню в <a href="https://merchant.gopay.kg/signup" target="_blank" rel="noopener">GoPay</a> (ИП или ОсОО, комиссия 1–2%).</li>
+            <li>В кабинете GoPay: «Разработчику» → API-ключ и секрет; в «Вебхуки» — адрес<br><code>https://mukrcoffee.62-113-109-193.sslip.io/api/pay/gopay</code> и событие <code>payment.committed</code>.</li>
+            <li>Передать ключи разработчику — он внесёт их в настройки сервера.</li></ol>` : ""}
       </section>`;
     const f = host.querySelector("#rules");
     f.onsubmit = async e => {
@@ -1085,25 +1205,26 @@
 
   // ---------- общее ----------
   async function logout() {
-    stopCam(); clearInterval(pollTimer);
+    stopCam(); clearInterval(pollTimer); closeSheet();
     try { await api("logout", {}); } catch {}
-    store.tok = ""; state = { user: null, me: null, guest: null, guestOrders: [], today: null, lastPts: null, lastOp: 0 };
+    store.tok = ""; state = fresh();
     render();
   }
 
   function draw() {
     viewId++;
     stopCam(); clearInterval(pollTimer); closeSheet(); queueSeen = null;
+    document.body.dataset.role = state.user?.role || "guest";
     if (!state.user) return location.hash === "#staff" ? viewStaffLogin() : viewLanding();
     if (state.user.role === "admin") return viewAdmin();
     if (state.user.role === "student") {
       state.lastPts = null; state.lastOp = 0;
       viewStudent(true); refreshMe();
-      // Пока карта открыта, следим за баллами: бариста отсканировал — штамп появляется сам.
-      pollTimer = setInterval(() => document.visibilityState === "visible" && refreshMe(), 4000);
+      // Пока карта открыта, следим за баллами: бариста отсканировал — оттиск появляется сам.
+      pollTimer = setInterval(() => document.visibilityState === "visible" && !sheet && refreshMe(), 5000);
     } else {
       viewDesk();
-      // Очередь проверяем часто — новый оплаченный заказ должен появиться у бариста сразу.
+      // Очередь проверяем часто — новый заказ должен появиться у бариста сразу.
       pollTimer = setInterval(() => { if (document.visibilityState === "visible") { loadQueue(); loadToday(); } }, 4000);
     }
   }
@@ -1128,14 +1249,15 @@
   async function boot() {
     backdrop();
     $app.innerHTML = `<div class="loading">${ico("coffee", 44)}</div>`;
-    api("rules").then(r => { RULES = r; }).catch(() => {});
+    const rules = api("rules").then(r => { RULES = r; }).catch(() => {});
     if (store.tok) {
       try { const me = await api("me"); state.user = me.user; state.me = me; } catch { }
     }
+    await rules;
     render();
   }
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && state.user?.role === "student") refreshMe();
+    if (document.visibilityState === "visible" && state.user?.role === "student" && !sheet) refreshMe();
   });
   addEventListener("hashchange", () => { if (!state.user) render(); });
   boot();

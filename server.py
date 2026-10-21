@@ -13,11 +13,17 @@
     GOPAY_API_KEY, GOPAY_SECRET_KEY   ключи из кабинета merchant.gopay.kg (Test или Live)
     GOPAY_WEBHOOK_SECRET              секрет вебхука (Разработчику → Вебхуки), events_url = PUBLIC_URL/api/pay/gopay
     PUBLIC_URL                        адрес этого сервера, напр. https://mukrcoffee.62-113-109-193.sslip.io
-    PAY_MODE=demo                     без ключей: заказ подтверждает бариста сканированием QR заказа (не деньги)
+    PAY_MODE=desk                     без ключей: ученик заказывает в приложении, платит на кассе; бариста
+                                      сканирует его QR, отмечает «наличные» или «картой» — так засчитываются деньги и баллы
+    PAY_MODE=demo                     то же, но для показа: такие продажи помечаются демо и не входят в выручку
+
+Нагрузка и защита: пул из WORKERS потоков (по умолчанию 32) и очередь соединений на 1024 — лишние ждут,
+а не обрываются; лимиты запросов на сессию и на адрес; не больше двух проверок пароля одновременно.
+Каждые сутки — копия базы в data/backups (хранится 14 штук).
 """
-import hashlib, hmac, json, os, re, secrets, sqlite3, sys, threading, time, urllib.request
+import gzip, hashlib, hmac, ipaddress, json, os, queue, re, secrets, selectors, socket, sqlite3, sys, threading, time, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -31,7 +37,8 @@ GOPAY_URL = os.environ.get("GOPAY_URL", "https://api.gopay.kg")
 GOPAY_KEY = os.environ.get("GOPAY_API_KEY", "")
 GOPAY_SECRET = os.environ.get("GOPAY_SECRET_KEY", "")
 GOPAY_HOOK_SECRET = os.environ.get("GOPAY_WEBHOOK_SECRET", "")
-PAY_MODE = "gopay" if GOPAY_KEY and GOPAY_SECRET else ("demo" if os.environ.get("PAY_MODE") == "demo" else "off")
+PAY_MODE = "gopay" if GOPAY_KEY and GOPAY_SECRET else (os.environ.get("PAY_MODE") if os.environ.get("PAY_MODE") in ("desk", "demo") else "off")
+CARD_QR = "MUKRCOFFEE:"       # личный QR ученика (тот же, что на карте)
 PICKUP = "MUKRCOFFEE-ORDER:"  # QR заказа у ученика: бариста сканирует его — заказ подтверждён и выдан
 
 # Правила кофейни по умолчанию. Администратор меняет их в кабинете (таблица settings).
@@ -39,7 +46,8 @@ DEFAULTS = {"per_cup": 10, "free_cost": 60, "price_s": 140, "price_l": 170}
 SIZES = ("s", "l")
 ORDER_TTL = 15 * 60       # сколько живёт неоплаченный заказ
 UNDO_WINDOW = 10 * 60     # бариста может отменить ошибочную операцию 10 минут
-SESSION_TTL = 180 * 24 * 3600
+SESSION_TTL = 180 * 24 * 3600        # ученик
+STAFF_TTL = 14 * 24 * 3600           # касса и администрация входят заново раз в две недели
 TZ = timezone(timedelta(hours=6))  # Бишкек
 
 STATIC = {"index.html", "app.css", "app.js", "icon.svg", "manifest.webmanifest",
@@ -49,15 +57,78 @@ TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
          ".webmanifest": "application/manifest+json"}
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # без 0/O, 1/I/L
 
+WORKERS = int(os.environ.get("WORKERS", "32"))
+PROXIES = [ipaddress.ip_network(n) for n in os.environ.get("TRUSTED_PROXIES", "127.0.0.0/8,172.16.0.0/12").split(",")]
+BACKUP_DIR = DB_PATH.parent / "backups"
+
 write_lock = threading.Lock()
-fails = {}  # ip -> [метки неудачных входов]
+hash_slots = threading.BoundedSemaphore(2)  # PBKDF2 дорогой: не даём сотне входов разом съесть процессор
+BODY_DEADLINE = 5     # тело запроса должно прийти целиком за 5 с, иначе соединение рвём
+
+
+class Limiter:
+    """Ведро с жетонами на ключ (сессия, адрес, логин): rate жетонов в секунду, запас burst."""
+
+    def __init__(self, rate, burst):
+        self.rate, self.burst, self.b, self.lock = rate, burst, {}, threading.Lock()
+
+    def take(self, key, n=1):
+        now = time.monotonic()
+        with self.lock:
+            tokens, ts = self.b.get(key, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - ts) * self.rate)
+            if tokens < n:
+                self.b[key] = (tokens, now)
+                return False
+            self.b[key] = (tokens - n, now)
+            return True
+
+    def give(self, key, n=1):
+        """Вернуть жетон (вход удался — неудачной попыткой он не считается)."""
+        with self.lock:
+            if key in self.b:
+                tokens, ts = self.b[key]
+                self.b[key] = (min(self.burst, tokens + n), ts)
+
+    def sweep(self):
+        """Забыть вёдра, которые давно полные (зовётся из housekeeping, а не на каждом запросе)."""
+        now = time.monotonic()
+        with self.lock:
+            self.b = {k: v for k, v in self.b.items() if v[0] + (now - v[1]) * self.rate < self.burst}
+
+
+# Лимиты подобраны под кампус, где сотни учеников сидят за одним адресом Wi-Fi:
+# запросы с сессией считаем по сессии, без сессии — по адресу, но щедро.
+LIM_SESSION = Limiter(5, 30)          # приложение ученика опрашивает раз в 2–5 с — запас десятикратный
+LIM_STAFF = Limiter(20, 120)          # касса
+LIM_IP = Limiter(60, 600)             # всё без сессии и все неудачные сессии с одного адреса
+LIM_LOGIN_IP = Limiter(2, 60)         # входы и регистрации с одного адреса: 60 разом, дальше 2 в секунду
+LIM_LOGIN_ACC = Limiter(1 / 60, 10)   # неверные пароли к логину с одного адреса: 10, потом раз в минуту
+LIM_REGISTER = Limiter(20, 3000)      # предохранитель на весь сервер — заметно выше лимита одного адреса
+LIMITERS = (LIM_SESSION, LIM_STAFF, LIM_IP, LIM_LOGIN_IP, LIM_LOGIN_ACC, LIM_REGISTER)
+
+_local = threading.local()
 
 
 def db():
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
+    """Одно соединение на поток: открывать его заново на каждый запрос дорого."""
+    con = getattr(_local, "con", None)
+    if con is None:
+        con = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        for pragma in ("foreign_keys=ON", "busy_timeout=10000", "synchronous=NORMAL",
+                       "cache_size=-1024", "temp_store=MEMORY"):
+            con.execute("PRAGMA " + pragma)
+        _local.con = con
     return con
+
+
+def token_key(tok):
+    """В базе лежит не сам токен сессии, а его хеш: утечка файла базы не даёт войти за учеников."""
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+HASH_TOKENS = True
 
 
 def columns(con, table):
@@ -110,6 +181,9 @@ def init_db():
             con.execute("ALTER TABLE ops ADD COLUMN order_id INTEGER")
         if "test" not in oc:
             con.execute("ALTER TABLE ops ADD COLUMN test INTEGER NOT NULL DEFAULT 0")
+        if "undone_by" not in oc:
+            con.execute("ALTER TABLE ops ADD COLUMN undone_by INTEGER")
+            con.execute("ALTER TABLE ops ADD COLUMN undone_at INTEGER")
         if "active" not in columns(con, "users"):
             con.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
         # Системный «сотрудник» — от его имени записываются оплаты, пришедшие от банка.
@@ -118,11 +192,17 @@ def init_db():
                         ("$", new_code(con), int(time.time())))
 
 
+_rules = {}
+
+
 def rules(con):
-    r = dict(DEFAULTS)
-    for row in con.execute("SELECT key, value FROM settings"):
-        r[row["key"]] = row["value"]
-    return r
+    """Правила читаются на каждом запросе — держим их в памяти, сбрасываем при сохранении настроек."""
+    if not _rules:
+        r = dict(DEFAULTS)
+        for row in con.execute("SELECT key, value FROM settings"):
+            r[row["key"]] = row["value"]
+        _rules.update(r)
+    return dict(_rules)
 
 
 def public_rules(r):
@@ -145,6 +225,17 @@ def check_pw(pw, stored):
     if not salt:
         return False
     return hmac.compare_digest(hash_pw(pw, salt), stored)
+
+
+def slow_hash(fn, *args):
+    """Хеширование пароля — не больше двух одновременно. Остальные ждут полсекунды и получают «занято»:
+    очередь входов не должна занимать потоки, которые обслуживают кассу."""
+    if not hash_slots.acquire(timeout=0.5):
+        raise ApiError(503, "Сервер занят, попробуйте через минуту")
+    try:
+        return fn(*args)
+    finally:
+        hash_slots.release()
 
 
 def norm_login(s):
@@ -224,6 +315,14 @@ def gopay_call(path, data):
     return res.get("data") or {}
 
 
+def same_amount(d, o):
+    """Сумма от банка — ровно наша (140 или 140.00, не 140.99), валюта — сомы, если банк её указал."""
+    amount = str(d.get("amount", "")).strip()
+    if d.get("currency") and str(d["currency"]).upper() not in ("KGS", "SOM"):
+        return False
+    return amount in (str(o["amount"]), f"{o['amount']}.00", f"{o['amount']}.0")
+
+
 def safe_url(u):
     """Ссылки на оплату от провайдера: только https и схемы приложений банков, без javascript: и data:."""
     u = str(u or "")
@@ -233,7 +332,10 @@ def safe_url(u):
 GOPAY_STATUS = {"COMMITTED": "paid", "FAILED": "failed", "EXPIRED": "expired", "CANCELLED": "cancelled"}
 
 
-def settle(con, o, new_status, test=False):
+DESK = ("desk", "demo")  # заказы с оплатой на кассе (demo — то же, но не деньги)
+
+
+def settle(con, o, new_status, test=False, pay="qr"):
     """Перевести заказ из pending в итоговый статус. Оплата даёт номер заказа и пишет деньги в выручку,
     но баллы пока 0 — их начислит бариста, когда отсканирует QR ученика и выдаст заказ (serve_order).
     Повторный вызов (повтор вебхука, параллельный опрос) ничего не меняет."""
@@ -249,19 +351,70 @@ def settle(con, o, new_status, test=False):
                 (now, num, int(test or o["test"]), o["id"]))
     con.execute("""INSERT INTO ops(user_id,staff_id,kind,size,delta,ts,pay,amount,order_id,test)
                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (o["user_id"], o["staff_id"] or system_id(con), "add", o["size"], 0, now, "qr",
+                (o["user_id"], o["staff_id"] or system_id(con), "add", o["size"], 0, now, pay,
                  o["amount"], o["id"], int(test or o["test"])))
     return con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
 
 
+_static = {}
+
+
+def static_file(path):
+    """Файл страницы из памяти: тело, сжатое тело и ETag. Перечитывается, если файл поменялся."""
+    f = ROOT / path
+    st = f.stat()
+    c = _static.get(path)
+    if not c or c[0] != st.st_mtime_ns:
+        data = f.read_bytes()
+        c = (st.st_mtime_ns, data, gzip.compress(data, 6), '"%s"' % hashlib.sha1(data).hexdigest()[:16])
+        _static[path] = c
+    return c[1:]
+
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(self), microphone=(), geolocation=()",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                               "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
+                               "media-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "mukr-coffee"
+    protocol_version = "HTTP/1.1"  # соединение с Caddy держится открытым — без нового рукопожатия на каждый запрос
+    timeout = 10                   # запрос, начатый и не дописанный за 10 с, обрывается
+
+    def handle(self):
+        """Ровно один запрос: дальше соединение возвращается в epoll (см. PoolServer)."""
+        self.close_connection = True
+        self.handle_one_request()
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.client_ip(), fmt % args))
+        if os.environ.get("ACCESS_LOG"):
+            sys.stderr.write("%s %s\n" % (self.client_ip(), fmt % args))
 
     def client_ip(self):
-        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+        """Адрес из X-Forwarded-For берём только от своего прокси: снаружи заголовок можно подделать."""
+        peer = self.client_address[0]
+        try:
+            trusted = any(ipaddress.ip_address(peer) in n for n in PROXIES)
+        except ValueError:
+            trusted = False
+        fwd = self.headers.get("X-Forwarded-For") if trusted else None
+        ip = fwd.split(",")[-1].strip() if fwd else peer
+        if ":" in ip:  # у IPv6 у одного человека целая /64 — лимит считаем по ней
+            try:
+                return str(ipaddress.ip_network(ip + "/64", strict=False))
+            except ValueError:
+                pass
+        return ip
+
+    def security(self):
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
 
     # ---------- ответы ----------
     def cors(self):
@@ -279,6 +432,9 @@ class Handler(BaseHTTPRequestHandler):
         self.cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if status == 429 or status == 503:
+            self.send_header("Retry-After", "5")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -286,22 +442,37 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.cors()
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_GET(self):
+    def do_HEAD(self):
+        self.do_GET(head=True)
+
+    def do_GET(self, head=False):
         if self.path.startswith("/api/"):
             return self.api("GET")
+        if not LIM_IP.take(self.client_ip()):
+            return self.send_json(429, {"error": "Слишком часто. Подождите несколько секунд"})
         path = self.path.split("?", 1)[0].lstrip("/") or "index.html"
         if path not in STATIC:
             path = "index.html"
-        f = ROOT / path
-        data = f.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", TYPES.get(f.suffix, "application/octet-stream"))
-        self.send_header("Cache-Control", "no-cache" if path == "index.html" else "public, max-age=300")
+        data, packed, etag = static_file(path)
+        self.send_response(304 if self.headers.get("If-None-Match") == etag else 200)
+        self.security()
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache" if path == "index.html" else "public, max-age=3600")
+        self.send_header("Vary", "Accept-Encoding")
+        if self.headers.get("If-None-Match") == etag:
+            self.send_header("Content-Length", "0")
+            return self.end_headers()
+        if "gzip" in self.headers.get("Accept-Encoding", ""):
+            data = packed
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Type", TYPES.get(Path(path).suffix, "application/octet-stream"))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if not head:
+            self.wfile.write(data)
 
     def do_POST(self):
         if self.path.startswith("/api/"):
@@ -310,10 +481,39 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- API ----------
     def raw_body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        if getattr(self, "_raw", None) is not None:
+            return self._raw
+        self._raw = b""  # если ниже ошибка — тело больше не читаем, соединение закроется
+        cl = self.headers.get("Content-Length") or "0"
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            raise ApiError(411, "Нужен Content-Length")
+        if not re.fullmatch(r"\d{1,6}", cl):
+            self.close_connection = True
+            raise ApiError(400, "Неверный запрос")
+        n = int(cl)
         if n > 20_000:
+            self.close_connection = True
             raise ApiError(413, "Слишком большой запрос")
-        return self.rfile.read(n) if n else b""
+        # Медленное тело (по байту раз в несколько секунд) не держит поток: общий срок на всё тело.
+        buf, until = bytearray(), time.monotonic() + BODY_DEADLINE
+        while len(buf) < n:
+            left = until - time.monotonic()
+            if left <= 0:
+                self.close_connection = True
+                raise ApiError(408, "Запрос шёл слишком долго")
+            self.connection.settimeout(min(left, self.timeout))
+            try:
+                chunk = self.rfile.read1(n - len(buf))
+            except (TimeoutError, socket.timeout):
+                chunk = b""
+            if not chunk:
+                self.close_connection = True
+                raise ApiError(408, "Запрос шёл слишком долго")
+            buf += chunk
+        self.connection.settimeout(self.timeout)
+        self._raw = bytes(buf)
+        return self._raw
 
     def body(self):
         try:
@@ -324,11 +524,18 @@ class Handler(BaseHTTPRequestHandler):
     def auth(self, con, staff=False, admin=False):
         h = self.headers.get("Authorization", "")
         tok = h[7:] if h.startswith("Bearer ") else ""
-        u = con.execute("""SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
-                           WHERE s.token=? AND s.created>? AND u.active=1""",
-                        (tok, int(time.time()) - SESSION_TTL)).fetchone() if tok else None
+        row = con.execute("""SELECT u.*, s.created AS s_created FROM sessions s JOIN users u ON u.id=s.user_id
+                             WHERE s.token=? AND s.created>? AND u.active=1""",
+                          (token_key(tok), int(time.time()) - SESSION_TTL)).fetchone() if 20 <= len(tok) <= 100 else None
+        u = row if row and (row["role"] == "student" or row["s_created"] > time.time() - STAFF_TTL) else None
         if not u:
+            # Подделанные токены считаются к лимиту адреса — иначе заголовок Authorization его обходил бы.
+            if not LIM_IP.take(self.client_ip(), 5):
+                raise ApiError(429, "Слишком часто. Подождите несколько секунд")
             raise ApiError(401, "Войдите заново")
+        lim = LIM_STAFF if u["role"] in ("staff", "admin") else LIM_SESSION
+        if not lim.take(u["id"]):
+            raise ApiError(429, "Слишком часто. Подождите несколько секунд")
         if admin and u["role"] != "admin":
             raise ApiError(403, "Это доступно только администрации")
         if staff and u["role"] not in ("staff", "admin"):
@@ -336,20 +543,30 @@ class Handler(BaseHTTPRequestHandler):
         return u
 
     def api(self, method):
+        self._raw = None
         route = self.path.split("?", 1)[0][len("/api/"):].strip("/")
         query = dict(p.split("=", 1) for p in self.path.split("?", 1)[1].split("&") if "=" in p) if "?" in self.path else {}
+        con = db()
         try:
-            con = db()
-            try:
-                res = self.route(con, method, route, query)
-            finally:
-                con.close()
+            # Без сессии — общий лимит по адресу; с сессией лимит считает auth() по самой сессии.
+            if not self.headers.get("Authorization") and not LIM_IP.take(self.client_ip()):
+                raise ApiError(429, "Слишком часто. Подождите несколько секунд")
+            res = self.route(con, method, route, query)
             self.send_json(200, res)
         except ApiError as e:
             self.send_json(e.status, {"error": e.msg})
         except Exception as e:  # noqa: BLE001
+            if con.in_transaction:
+                con.rollback()
             sys.stderr.write(f"ERROR {method} {route}: {e!r}\n")
             self.send_json(500, {"error": "Сбой на сервере. Попробуйте ещё раз"})
+        finally:
+            # Тело, которое маршрут не прочитал, вычитываем — иначе оно испортит следующий запрос в соединении.
+            if self._raw is None and self.headers.get("Content-Length") not in (None, "0"):
+                try:
+                    self.raw_body()
+                except ApiError:
+                    pass
 
     def route(self, con, m, r, q):
         parts = r.split("/")
@@ -362,7 +579,7 @@ class Handler(BaseHTTPRequestHandler):
         if m == "POST" and r == "logout":
             h = self.headers.get("Authorization", "")
             with write_lock, con:
-                con.execute("DELETE FROM sessions WHERE token=?", (h[7:],))
+                con.execute("DELETE FROM sessions WHERE token=?", (token_key(h[7:]),))
             return {"ok": True}
         if m == "GET" and r == "me":
             return self.me(con, self.auth(con))
@@ -376,7 +593,9 @@ class Handler(BaseHTTPRequestHandler):
         if m == "POST" and len(parts) == 3 and parts[0] == "orders" and parts[2] == "cancel":
             return self.cancel_order(con, self.auth(con), parts[1])
         if m == "POST" and r == "orders/scan":
-            return self.scan_order(con, self.auth(con, staff=True), self.body())
+            return self.scan(con, self.auth(con, staff=True), self.body())
+        if m == "GET" and r == "health":
+            return {"ok": True}
         if m == "POST" and len(parts) == 3 and parts[0] == "orders" and parts[2] == "serve":
             return self.serve_order(con, self.auth(con, staff=True), parts[1], self.body())
         # --- касса ---
@@ -391,8 +610,7 @@ class Handler(BaseHTTPRequestHandler):
             staff = self.auth(con, staff=True)
             return self.undo(con, staff, parts[1])
         if m == "GET" and r == "today":
-            self.auth(con, staff=True)
-            return self.today(con)
+            return self.today(con, self.auth(con, staff=True))
         if m == "GET" and r == "queue":
             self.auth(con, staff=True)
             return self.queue(con)
@@ -434,34 +652,50 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Укажите группу")
         if not re.fullmatch(r"996\d{9}", login):
             raise ApiError(400, "Телефон в формате 0700 123 456 или +996 700 123 456")
-        if len(pw) < 6:
-            raise ApiError(400, "Пароль — не короче 6 символов")
+        if not 6 <= len(pw) <= 128:
+            raise ApiError(400, "Пароль — от 6 до 128 символов")
+        if b.get("website"):  # невидимое поле-ловушка: человек его не заполняет, бот — да
+            raise ApiError(400, "Не получилось. Обновите страницу")
+        if not LIM_LOGIN_IP.take(self.client_ip()) or not LIM_REGISTER.take("all"):
+            raise ApiError(429, "Слишком много регистраций. Попробуйте через минуту")
+        if con.execute("SELECT 1 FROM users WHERE login=?", (login,)).fetchone():
+            raise ApiError(409, "Этот телефон уже зарегистрирован. Войдите")
+        stored = slow_hash(hash_pw, pw)  # вне блокировки записи: хеш считается ~0,1 с
         with write_lock, con:
             if con.execute("SELECT 1 FROM users WHERE login=?", (login,)).fetchone():
                 raise ApiError(409, "Этот телефон уже зарегистрирован. Войдите")
             cur = con.execute("INSERT INTO users(role,login,name,grp,pass,code,created) VALUES('student',?,?,?,?,?,?)",
-                              (login, name, grp, hash_pw(pw), new_code(con), int(time.time())))
+                              (login, name, grp, stored, new_code(con), int(time.time())))
             return self.session(con, cur.lastrowid)
 
     def login(self, con, b):
-        ip, now = self.client_ip(), time.time()
-        recent = [t for t in fails.get(ip, []) if now - t < 600]
-        if len(recent) >= 10:
-            raise ApiError(429, "Слишком много попыток. Подождите 10 минут")
-        login = norm_login(b.get("phone"))
+        login = norm_login(b.get("phone"))[:40]
+        pw = str(b.get("password", ""))[:128]
+        ip = self.client_ip()
+        if not LIM_LOGIN_IP.take(ip):
+            raise ApiError(429, "Слишком много попыток с этой сети. Подождите минуту")
+        # Подбор пароля: 10 ошибок к одному логину с одного адреса — дальше раз в минуту. Ключ «логин + адрес»,
+        # чтобы чужой человек не мог заблокировать вход владельцу. Жетон берём до проверки и возвращаем при успехе.
+        acc = login + "|" + ip
+        if not LIM_LOGIN_ACC.take(acc):
+            raise ApiError(429, "Слишком много неверных паролей. Подождите минуту")
         u = con.execute("SELECT * FROM users WHERE login=? AND role!='system'", (login,)).fetchone()
-        if not u or not check_pw(str(b.get("password", "")), u["pass"]):
-            fails[ip] = recent + [now]
+        # Для несуществующего логина тоже считаем хеш — по времени ответа не узнать, есть ли такой номер.
+        ok = slow_hash(check_pw, pw, u["pass"] if u else "00" * 16 + "$")
+        if not u or not ok:
             raise ApiError(401, "Неверный логин или пароль")
+        LIM_LOGIN_ACC.give(acc)
         if not u["active"]:
             raise ApiError(403, "Доступ отключён. Обратитесь к администрации")
-        fails.pop(ip, None)
+        if u["role"] != "student" and (self.headers.get("Origin") or "").endswith(".github.io"):
+            # Токен кассы не должен лежать в браузере на общем адресе github.io — только на своём сервере.
+            raise ApiError(403, "Касса и кабинет открываются только на " + (PUBLIC_URL or "сервере кофейни"))
         with write_lock, con:
             return self.session(con, u["id"])
 
     def session(self, con, uid):
         tok = secrets.token_urlsafe(32)
-        con.execute("INSERT INTO sessions VALUES(?,?,?)", (tok, uid, int(time.time())))
+        con.execute("INSERT INTO sessions VALUES(?,?,?)", (token_key(tok), uid, int(time.time())))
         u = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         return {"token": tok, "user": public_user(u)}
 
@@ -502,9 +736,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(503, "Оплата по QR пока не подключена. Оплатите на кассе")
             amount = r["price_" + size]
             ext = f"MC-{now}-{secrets.token_hex(4)}"
+            provider = "gopay" if PAY_MODE == "gopay" else "desk"
             cur = con.execute("""INSERT INTO orders(user_id,size,amount,provider,ext_id,via,staff_id,test,created,expires)
                                  VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                              (u["id"], size, amount, PAY_MODE, ext, via, staff_id, int(PAY_MODE == "demo"),
+                              (u["id"], size, amount, provider, ext, via, staff_id, int(PAY_MODE == "demo"),
                                now, now + ORDER_TTL))
             oid = cur.lastrowid
         if PAY_MODE == "gopay":
@@ -524,10 +759,6 @@ class Handler(BaseHTTPRequestHandler):
                             (d.get("payment_id"), d.get("qr_data"), safe_url(d.get("checkout_url")),
                              json.dumps({k: v for k, v in (d.get("app_links") or {}).items() if safe_url(v)}),
                              int(bool(d.get("testing_mode"))), oid))
-        else:
-            # Демо: банковского QR нет — ученик показывает QR заказа, бариста сканирует и этим подтверждает.
-            with write_lock, con:
-                con.execute("UPDATE orders SET qr_data=? WHERE id=?", (PICKUP + ext, oid))
         return {"order": order_row(con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone(), True)}
 
     def own_order(self, con, u, oid):
@@ -550,7 +781,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     d = gopay_call("/v1/payments/query", {"order_id": o["ext_id"]})
                     st = GOPAY_STATUS.get(d.get("status"))
-                    if st and (st != "paid" or str(d.get("amount", "")).split(".")[0] == str(o["amount"])):
+                    if st and (st != "paid" or same_amount(d, o)):
                         with write_lock, con:
                             o = settle(con, o, st, test=bool(d.get("testing_mode")))
                 except ApiError:
@@ -574,13 +805,29 @@ class Handler(BaseHTTPRequestHandler):
         return {"order": order_row(o)}
 
     def waiting(self, con, u):
-        """Оплаченные заказы ученика, которые ждут выдачи, — бариста видит их после сканирования QR."""
-        rows = con.execute("SELECT * FROM orders WHERE user_id=? AND status='paid' ORDER BY paid_at", (u["id"],)).fetchall()
+        """Заказы ученика, которые ждут бариста: оплаченные банком или за баллы и ещё не оплаченные на кассе."""
+        rows = con.execute("""SELECT * FROM orders WHERE user_id=? AND (status='paid' OR
+                              (status='pending' AND provider IN ('desk','demo') AND expires>?)) ORDER BY created""",
+                           (u["id"], int(time.time()))).fetchall()
         return [order_row(o) for o in rows]
+
+    def scan(self, con, staff, b):
+        """Бариста отсканировал QR с телефона ученика — личный (карта) или старый QR заказа.
+        Ничего не меняет: возвращает карту и заказы, которые ждут. Выдача — отдельной кнопкой (serve_order)."""
+        qr = str(b.get("qr", "")).strip()[:120]
+        if qr.startswith(PICKUP):
+            o = con.execute("SELECT * FROM orders WHERE ext_id=?", (qr[len(PICKUP):],)).fetchone()
+            u = con.execute("SELECT * FROM users WHERE id=?", (o["user_id"],)).fetchone() if o else None
+            if not u:
+                raise ApiError(404, "Заказ не найден")
+        else:
+            u = self.card(con, qr[len(CARD_QR):] if qr.startswith(CARD_QR) else qr)
+        return {"card": public_card(u), "orders": self.waiting(con, u)}
 
     def serve_order(self, con, staff, oid, b):
         """Выдача только по отсканированному QR ученика: код карты должен совпасть с заказом.
-        Здесь же, а не при оплате, начисляются баллы за стакан."""
+        Заказ «оплата на кассе» бариста закрывает, отметив способ оплаты, — тогда и деньги, и баллы.
+        Баллы начисляются здесь, а не при оплате."""
         o = self.own_order(con, staff, oid)
         code = re.sub(r"[^A-Za-z0-9]", "", str(b.get("code", ""))).upper()
         u = con.execute("SELECT * FROM users WHERE id=?", (o["user_id"],)).fetchone()
@@ -588,29 +835,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "Сначала отсканируйте QR ученика")
         if code != u["code"]:
             raise ApiError(409, "Это QR другого ученика — заказ не его")
-        with write_lock, con:
-            return self.hand_over(con, staff, o)
-
-    def scan_order(self, con, staff, b):
-        """Бариста отсканировал QR заказа на телефоне ученика. Демо-заказ этим и подтверждается;
-        заказ GoPay должен быть уже оплачен банком."""
-        qr = str(b.get("qr", "")).strip()
-        ext = qr[len(PICKUP):] if qr.startswith(PICKUP) else ""
-        o = con.execute("SELECT * FROM orders WHERE ext_id=?", (ext,)).fetchone() if ext else None
-        if not o:
-            raise ApiError(404, "Заказ не найден")
+        pay = b.get("pay")
         with write_lock, con:
             o = con.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone()
-            if o["status"] == "pending" and o["expires"] < time.time():
-                o = settle(con, o, "expired")
-            if o["status"] == "pending" and o["provider"] == "demo":
-                o = settle(con, o, "paid", test=True)
-            if o["status"] == "pending":
+            if o["status"] == "pending" and o["provider"] in DESK:
+                if o["expires"] < time.time():
+                    raise ApiError(409, "Заказ просрочен — пусть ученик оформит заново")
+                if pay not in ("cash", "card"):
+                    raise ApiError(400, "Отметьте, как ученик заплатил: наличными или картой")
+                o = settle(con, o, "paid", test=o["test"], pay=pay)
+            elif o["status"] == "pending":
                 raise ApiError(409, "Заказ ещё не оплачен — пусть ученик оплатит в банке")
-            if o["status"] == "served":
-                raise ApiError(409, f"Заказ №{o['num']} уже выдан")
-            if o["status"] != "paid":
-                raise ApiError(409, "Заказ отменён или время вышло — пусть оформит заново")
             return self.hand_over(con, staff, o)
 
     def hand_over(self, con, staff, o):
@@ -653,10 +888,15 @@ class Handler(BaseHTTPRequestHandler):
         o = con.execute("SELECT * FROM orders WHERE ext_id=?", (str(d["order_id"]),)).fetchone()
         if not o or not status:
             return {"ok": True}  # чужой или неизвестный — подтверждаем, чтобы GoPay не повторял
-        if status == "paid" and str(d.get("amount", "")).split(".")[0] != str(o["amount"]):
-            sys.stderr.write(f"GoPay: сумма не сходится по {o['ext_id']}: {d.get('amount')} != {o['amount']}\n")
+        if status == "paid" and not same_amount(d, o):
+            sys.stderr.write(f"GoPay: сумма не сходится по {o['ext_id']}: {d.get('amount')} {d.get('currency')} != {o['amount']}\n")
             raise ApiError(409, "Сумма не совпадает")
         with write_lock, con:
+            if status == "paid" and o["status"] in ("expired", "cancelled"):
+                # Деньги пришли, когда заказ у нас уже закрылся (истёк срок, ученик открыл новый) — не теряем их:
+                # заказ снова становится оплаченным и попадает в очередь к бариста.
+                sys.stderr.write(f"GoPay: поздняя оплата закрытого заказа {o['ext_id']} — восстановлен\n")
+                con.execute("UPDATE orders SET status='pending' WHERE id=?", (o["id"],))
             settle(con, o, status, test=bool(d.get("testing_mode")))
         return {"ok": True}
 
@@ -669,7 +909,7 @@ class Handler(BaseHTTPRequestHandler):
         with write_lock, con:
             u = self.card(con, code)
             if kind == "add":
-                delta, amount, pay = r["per_cup"], r["price_" + size], "cash"
+                delta, amount, pay = r["per_cup"], r["price_" + size], "card" if b.get("pay") == "card" else "cash"
             else:
                 if u["points"] < r["free_cost"]:
                     raise ApiError(409, f"Не хватает баллов: на карте {u['points']}, нужно {r['free_cost']}")
@@ -686,41 +926,56 @@ class Handler(BaseHTTPRequestHandler):
             o = con.execute("SELECT * FROM ops WHERE id=?", (op_id,)).fetchone()
             if not o or o["undone"]:
                 raise ApiError(404, "Операция уже отменена или не найдена")
-            if o["pay"] == "qr" and staff["role"] != "admin":
-                raise ApiError(409, "Оплата по QR уже пришла — отменить может только администрация")
+            if staff["role"] != "admin":
+                # Бариста отменяет только ошибочную продажу на кассе: не заказ, не списание за баллы, не чужую.
+                if o["pay"] == "qr" or o["kind"] == "redeem" or o["order_id"]:
+                    raise ApiError(409, "Это может отменить только администрация")
+                if o["staff_id"] != staff["id"]:
+                    raise ApiError(409, "Отменить можно только свою продажу")
             if time.time() - o["ts"] > UNDO_WINDOW and staff["role"] != "admin":
                 raise ApiError(409, "Отменить можно в течение 10 минут")
             u = con.execute("SELECT * FROM users WHERE id=?", (o["user_id"],)).fetchone()
             if u["points"] - o["delta"] < 0:
                 raise ApiError(409, "Баллы уже потрачены — отменить нельзя")
             con.execute("UPDATE users SET points=points-? WHERE id=?", (o["delta"], u["id"]))
-            con.execute("UPDATE ops SET undone=1 WHERE id=?", (op_id,))
+            con.execute("UPDATE ops SET undone=1, undone_by=?, undone_at=? WHERE id=?", (staff["id"], int(time.time()), op_id))
             u = con.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
             return {"card": public_card(u)}
 
-    def today(self, con):
+    def can_undo(self, staff, r):
+        """Та же проверка, что в undo(): кнопку «Отменить» показываем, только если отмена пройдёт."""
+        if r["undone"]:
+            return False
+        if staff["role"] == "admin":
+            return True
+        return (r["pay"] != "qr" and r["kind"] != "redeem" and not r["order_id"] and r["staff_id"] == staff["id"]
+                and time.time() - r["ts"] <= UNDO_WINDOW)
+
+    def today(self, con, staff):
         start = day_start()
-        rows = con.execute("""SELECT o.*, u.name, u.grp, u.code FROM ops o JOIN users u ON u.id=o.user_id
+        rows = con.execute("""SELECT o.*, u.name, u.grp, u.code, b.name AS undone_name FROM ops o JOIN users u ON u.id=o.user_id
+                              LEFT JOIN users b ON b.id=o.undone_by
                               WHERE o.ts>=? ORDER BY o.ts DESC LIMIT 200""", (start,)).fetchall()
         live = [r for r in rows if not r["undone"]]
         money = [r for r in live if r["kind"] == "add" and not r["test"]]
         return {"ops": [dict(op_row(r), name=r["name"], group=r["grp"], code=r["code"], test=bool(r["test"]),
-                             canUndo=not r["undone"] and r["pay"] != "qr" and time.time() - r["ts"] <= UNDO_WINDOW)
+                             canUndo=self.can_undo(staff, r), undoneBy=r["undone_name"])
                         for r in rows if r["delta"]],  # оплачен, но ещё не выдан — в ленте не показываем
                 "sold": sum(1 for r in live if r["kind"] == "add"),
                 "free": sum(1 for r in live if r["kind"] == "redeem"),
                 "revenue": sum(r["amount"] for r in money),
                 "qr": sum(r["amount"] for r in money if r["pay"] == "qr"),
+                "card": sum(r["amount"] for r in money if r["pay"] == "card"),
                 "cash": sum(r["amount"] for r in money if r["pay"] == "cash")}
 
     def queue(self, con):
         """Заказы, которые ждут выдачи (оплаченные и демо, ждущие сканирования), и последние выданные."""
         start, now = day_start(), int(time.time())
         q = """SELECT o.*, u.name, u.grp FROM orders o JOIN users u ON u.id=o.user_id WHERE """
-        wait = con.execute(q + """(o.status='paid' AND o.paid_at>=?) OR (o.status='pending' AND o.provider='demo' AND o.expires>?)
+        wait = con.execute(q + """(o.status='paid' AND o.paid_at>=?) OR (o.status='pending' AND o.provider IN ('desk','demo') AND o.expires>?)
                                   ORDER BY o.created""", (start - 6 * 3600, now)).fetchall()
         done = con.execute(q + "o.status='served' AND o.served_at>=? ORDER BY o.served_at DESC LIMIT 8", (start,)).fetchall()
-        pend = con.execute("SELECT COUNT(*) FROM orders WHERE status='pending' AND provider!='demo' AND expires>?", (now,)).fetchone()[0]
+        pend = con.execute("SELECT COUNT(*) FROM orders WHERE status='pending' AND provider='gopay' AND expires>?", (now,)).fetchone()[0]
         row = lambda o: dict(order_row(o), name=o["name"], group=o["grp"])
         return {"waiting": [row(o) for o in wait], "served": [row(o) for o in done], "pending": pend}
 
@@ -761,6 +1016,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(404, "Сотрудник не найден")
                 if u["id"] == admin["id"] and p[2] == "toggle":
                     raise ApiError(409, "Себя отключить нельзя")
+                if u["role"] == "admin" and u["id"] != admin["id"]:
+                    raise ApiError(403, "Пароль и доступ другого администратора меняются только на сервере")
                 con.execute("DELETE FROM sessions WHERE user_id=?", (u["id"],))
                 if p[2] == "reset":
                     pw = secrets.token_urlsafe(6)
@@ -768,6 +1025,32 @@ class Handler(BaseHTTPRequestHandler):
                     return {"login": u["login"], "password": pw}
                 con.execute("UPDATE users SET active=1-active WHERE id=?", (u["id"],))
                 return {"ok": True}
+        if m == "GET" and p == ["students"]:
+            # Поиск по имени, телефону или коду карты; без запроса — последние зарегистрированные.
+            qs = re.sub(r"[%_]", "", urllib.parse.unquote_plus(q.get("q", "")).strip())[:40]
+            sql = "SELECT * FROM users WHERE role='student'"
+            args = []
+            if qs:
+                digits = re.sub(r"\D", "", qs)
+                sql += " AND (name LIKE ? OR code=? OR grp LIKE ?" + (" OR login LIKE ?" if len(digits) >= 3 else "") + ")"
+                args = [f"%{qs}%", re.sub(r"[^A-Za-z0-9]", "", qs).upper(), f"%{qs}%"] + ([f"%{digits[-9:]}%"] if len(digits) >= 3 else [])
+            rows = con.execute(sql + " ORDER BY id DESC LIMIT 50", args).fetchall()
+            total = con.execute("SELECT COUNT(*) FROM users WHERE role='student'").fetchone()[0]
+            return {"total": total, "students": [dict(public_card(u), id=u["id"], phone="+" + u["login"], active=bool(u["active"]),
+                                                      created=u["created"]) for u in rows]}
+        if m == "POST" and len(p) == 3 and p[0] == "students" and p[2] in ("reset", "toggle"):
+            with write_lock, con:
+                u = con.execute("SELECT * FROM users WHERE id=? AND role='student'", (p[1],)).fetchone()
+                if not u:
+                    raise ApiError(404, "Ученик не найден")
+                if p[2] == "toggle":
+                    con.execute("UPDATE users SET active=? WHERE id=?", (0 if u["active"] else 1, u["id"]))
+                    con.execute("DELETE FROM sessions WHERE user_id=?", (u["id"],))
+                    return {"active": not u["active"]}
+                pw = "".join(secrets.choice("23456789") for _ in range(6))
+                con.execute("UPDATE users SET pass=? WHERE id=?", (hash_pw(pw), u["id"]))
+                con.execute("DELETE FROM sessions WHERE user_id=?", (u["id"],))
+                return {"password": pw}
         if m == "POST" and p == ["settings"]:
             b = self.body()
             new = {}
@@ -786,6 +1069,7 @@ class Handler(BaseHTTPRequestHandler):
             with write_lock, con:
                 for k, v in new.items():
                     con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+            _rules.clear()
             return public_rules(rules(con))
         raise ApiError(404, "Нет такого адреса")
 
@@ -802,6 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
             series.append({"day": datetime.fromtimestamp(a, TZ).strftime("%Y-%m-%d"),
                            "qr": sum(r["amount"] for r in day if r["kind"] == "add" and r["pay"] == "qr"),
                            "cash": sum(r["amount"] for r in day if r["kind"] == "add" and r["pay"] == "cash"),
+                           "card": sum(r["amount"] for r in day if r["kind"] == "add" and r["pay"] == "card"),
                            "cups": sum(1 for r in day if r["kind"] == "add"),
                            "free": sum(1 for r in day if r["kind"] == "redeem")})
         adds = [r for r in rows if r["kind"] == "add"]
@@ -816,11 +1101,149 @@ class Handler(BaseHTTPRequestHandler):
         demo = con.execute("SELECT COUNT(*) FROM ops WHERE ts>=? AND test=1 AND undone=0", (start,)).fetchone()[0]
         return {"days": days, "series": series,
                 "revenue": sum(r["amount"] for r in adds), "qr": sum(r["amount"] for r in adds if r["pay"] == "qr"),
-                "cash": sum(r["amount"] for r in adds if r["pay"] == "cash"), "cups": len(adds),
+                "cash": sum(r["amount"] for r in adds if r["pay"] == "cash"),
+                "card": sum(r["amount"] for r in adds if r["pay"] == "card"), "cups": len(adds),
                 "free": sum(1 for r in rows if r["kind"] == "redeem"),
                 "freeCost": sum(rules(con)["price_" + r["size"]] for r in rows if r["kind"] == "redeem"),
                 "students": students, "newStudents": new_students, "demoOps": demo, "pay": PAY_MODE,
                 "top": [dict(t) for t in top], "byStaff": [dict(s) for s in by_staff]}
+
+
+class PoolServer(HTTPServer):
+    """HTTP-сервер: постоянный пул потоков + epoll для ожидающих соединений.
+
+    Соединение, которое молчит (держит keep-alive или медленно подключилось), не занимает поток:
+    оно лежит в epoll, и поток берёт его, только когда пришли данные. Так 32 потока обслуживают
+    тысячи открытых соединений, а приём «открыть сотни сокетов и молчать» (slowloris) не работает.
+    """
+    request_queue_size = 1024
+    allow_reuse_address = True
+    IDLE = 15            # сколько ждём следующий запрос в открытом соединении, с
+    MAX_CONN = 4000      # больше открытых соединений не держим — новые сразу закрываются
+
+    def __init__(self, addr, handler, workers=WORKERS):
+        super().__init__(addr, handler)
+        self.jobs = queue.Queue()
+        self.sel = selectors.DefaultSelector()
+        self.parked = queue.SimpleQueue()          # сокеты от потоков → в epoll (сам epoll трогает один поток)
+        self.wake_r, self.wake_w = socket.socketpair()
+        self.wake_r.setblocking(False)
+        self.sel.register(self.wake_r, selectors.EVENT_READ, None)
+        self.idle = {}                              # сокет → (адрес, срок)
+        threading.Thread(target=self.watch, daemon=True).start()
+        for _ in range(workers):
+            threading.Thread(target=self.worker, daemon=True).start()
+
+    def park(self, req, addr):
+        self.parked.put((req, addr))
+        try:
+            self.wake_w.send(b"x")
+        except OSError:
+            pass
+
+    def watch(self):
+        next_sweep = 0
+        while True:
+            for key, _ in self.sel.select(timeout=1):
+                if key.data is None:
+                    try:
+                        self.wake_r.recv(4096)
+                    except OSError:
+                        pass
+                    continue
+                self.sel.unregister(key.fileobj)
+                self.idle.pop(key.fileobj, None)
+                self.jobs.put((key.fileobj, key.data))
+            while True:
+                try:
+                    req, addr = self.parked.get_nowait()
+                except queue.Empty:
+                    break
+                if len(self.idle) >= self.MAX_CONN:
+                    self.shutdown_request(req)
+                    continue
+                self.idle[req] = (addr, time.monotonic() + self.IDLE)
+                self.sel.register(req, selectors.EVENT_READ, addr)
+            now = time.monotonic()
+            if now >= next_sweep:  # просроченные ищем раз в секунду, а не после каждого запроса
+                next_sweep = now + 1
+                for req, (addr, until) in list(self.idle.items()):
+                    if until < now:
+                        self.sel.unregister(req)
+                        del self.idle[req]
+                        self.shutdown_request(req)
+
+    def worker(self):
+        while True:
+            req, addr = self.jobs.get()
+            try:
+                h = self.RequestHandlerClass(req, addr, self)
+                keep = not h.close_connection
+            except Exception:  # noqa: BLE001
+                self.handle_error(req, addr)
+                keep = False
+            if keep:
+                self.park(req, addr)
+            else:
+                self.shutdown_request(req)
+
+    def process_request(self, req, addr):
+        req.settimeout(Handler.timeout)
+        self.park(req, addr)   # новое соединение тоже сначала ждёт данных в epoll
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        super().server_bind()
+
+    def handle_error(self, req, addr):
+        e = sys.exc_info()[1]
+        if not isinstance(e, (ConnectionError, TimeoutError, socket.timeout)):
+            super().handle_error(req, addr)
+
+
+def raise_fd_limit():
+    """Каждое открытое соединение — дескриптор; 1024 по умолчанию мало для тысяч клиентов."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 65536), hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def backup(keep=14):
+    """Копия базы средствами SQLite (безопасно на ходу) в data/backups, храним последние keep."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dst = BACKUP_DIR / datetime.now(TZ).strftime("coffee-%Y%m%d-%H%M.db")
+    src = sqlite3.connect(DB_PATH, timeout=30)
+    out = sqlite3.connect(dst)
+    try:
+        src.backup(out)
+    finally:
+        out.close(); src.close()
+    os.chmod(dst, 0o600)
+    for old in sorted(BACKUP_DIR.glob("coffee-*.db"))[:-keep]:
+        old.unlink()
+    return dst
+
+
+def housekeeping():
+    """Раз в 10 минут: просроченные заказы закрываем, старые сессии удаляем; раз в сутки — копия базы."""
+    last_backup = 0
+    while True:
+        try:
+            con, now = db(), int(time.time())
+            with write_lock, con:
+                con.execute("UPDATE orders SET status='expired' WHERE status='pending' AND expires<?", (now,))
+                con.execute("DELETE FROM sessions WHERE created<?", (now - SESSION_TTL,))
+            for lim in LIMITERS:
+                lim.sweep()
+            if now - last_backup > 86400:
+                backup()
+                last_backup = now
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write(f"housekeeping: {e!r}\n")
+        time.sleep(600)
 
 
 def cli(args):
@@ -852,5 +1275,7 @@ if __name__ == "__main__":
         cli(sys.argv[1:])
     else:
         init_db()
-        print(f"МУКР Кофе: http://{HOST}:{PORT} · оплата: {PAY_MODE}", flush=True)
-        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+        raise_fd_limit()
+        threading.Thread(target=housekeeping, daemon=True).start()
+        print(f"МУКР Кофе: http://{HOST}:{PORT} · оплата: {PAY_MODE} · потоков: {WORKERS}", flush=True)
+        PoolServer((HOST, PORT), Handler).serve_forever()
